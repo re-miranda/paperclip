@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { statusCardRefreshPolicySchema } from "@paperclipai/shared";
 import {
   chooseStatusCardUpdateKind,
+  diffStatusCardAttention,
   diffStatusCardFingerprint,
   evaluateStatusCardPolicy,
   extractIssueMentions,
@@ -100,5 +101,42 @@ describe("status card update engine", () => {
       issueIds: ["0f5a2c71-9f5c-4b6c-8a9e-1b2c3d4e5f60"],
     });
     expect(extractIssueMentions("No references here.")).toEqual({ identifiers: [], issueIds: [] });
+  });
+
+  it("reports owner Attention items that appear or resolve, but not items that only move", () => {
+    const entry = (identifier: string, attentionItemIds?: string[]) => ({
+      status: "blocked", updatedAt: "2026-11-04T18:00:00.000Z", identifier, title: identifier, attentionItemIds,
+    });
+    const before = { a: entry("MIR-374", ["moved", "resolved"]), b: entry("MIR-317") };
+    const after = { a: entry("MIR-374"), b: entry("MIR-317", ["moved", "appeared"]) };
+
+    expect(diffStatusCardAttention(before, after)).toEqual([
+      { issueId: "b", identifier: "MIR-317", title: "MIR-317", from: null, to: "appeared", changeKind: "attention" },
+      { issueId: "a", identifier: "MIR-374", title: "MIR-374", from: "resolved", to: null, changeKind: "attention" },
+    ]);
+    expect(diffStatusCardFingerprint(before, after).map((change) => change.changeKind)).toEqual(["attention", "attention"]);
+  });
+
+  it("treats a fingerprint saved before owner Attention as having no items", () => {
+    const legacy = { a: { status: "blocked", updatedAt: "2026-11-04T18:00:00.000Z", identifier: "MIR-374" } };
+    const current = { a: { ...legacy.a, attentionItemIds: ["card"] } };
+
+    expect(diffStatusCardFingerprint(legacy, current)).toEqual([
+      expect.objectContaining({ issueId: "a", from: null, to: "card", changeKind: "attention" }),
+    ]);
+  });
+
+  it("keeps owner Attention changes whatever the card's trigger settings", () => {
+    const allOff = statusCardRefreshPolicySchema.parse({
+      mode: "reactive",
+      debounceSeconds: 60,
+      triggers: { anyUpdate: false, membershipChanges: false, assigneeChanges: false, humanComments: false, statusTransitions: false },
+    });
+    const changes = diffStatusCardFingerprint(
+      { a: { status: "todo", updatedAt: "2026-11-04T18:00:00.000Z", identifier: "MIR-374" } },
+      { a: { status: "in_progress", updatedAt: "2026-11-04T18:41:00.000Z", identifier: "MIR-374", attentionItemIds: ["card"] } },
+    );
+
+    expect(filterStatusCardChanges(changes, allOff).map((change) => change.changeKind)).toEqual(["attention"]);
   });
 });

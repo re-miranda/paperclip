@@ -3686,15 +3686,31 @@ export async function ensureAssignmentIssueAccessGrant(
   return grant;
 }
 
-async function terminalExplicitBlockersByRoot(
+/**
+ * Unresolved "blocked by" links upstream of a set of issues. `nodesById` holds
+ * the roots plus every reached blocker in breadth-first order; `edgesByIssueId`
+ * maps an issue to the blockers it waits on.
+ */
+export type ExplicitBlockerGraph = {
+  nodesById: Map<string, IssueRelationIssueSummary>;
+  edgesByIssueId: Map<string, string[]>;
+};
+
+/**
+ * Walk explicit `blocks` relations upstream from `roots`, skipping blockers
+ * that are already done. Bounded by the blocker-attention depth and node caps,
+ * so cycles and very large graphs stay cheap.
+ *
+ * @example
+ * const graph = await walkExplicitBlockerGraph(companyId, [blockedIssue], db);
+ * graph.edgesByIssueId.get(blockedIssue.id); // ids of the issues blocking it
+ */
+export async function walkExplicitBlockerGraph(
   companyId: string,
   roots: IssueRelationIssueSummary[],
-  dbOrTx: DbReader,
-): Promise<Map<string, IssueRelationIssueSummary[]>> {
+  dbOrTx: Pick<Db, "select">,
+): Promise<ExplicitBlockerGraph> {
   const rootIds = [...new Set(roots.map((root) => root.id))];
-  const terminalByRoot = new Map<string, IssueRelationIssueSummary[]>();
-  if (rootIds.length === 0) return terminalByRoot;
-
   const nodesById = new Map<string, IssueRelationIssueSummary>();
   const edgesByIssueId = new Map<string, string[]>();
   for (const root of roots) nodesById.set(root.id, root);
@@ -3749,6 +3765,20 @@ async function terminalExplicitBlockersByRoot(
     if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) break;
     frontier = [...nextFrontier];
   }
+
+  return { nodesById, edgesByIssueId };
+}
+
+async function terminalExplicitBlockersByRoot(
+  companyId: string,
+  roots: IssueRelationIssueSummary[],
+  dbOrTx: DbReader,
+): Promise<Map<string, IssueRelationIssueSummary[]>> {
+  const rootIds = [...new Set(roots.map((root) => root.id))];
+  const terminalByRoot = new Map<string, IssueRelationIssueSummary[]>();
+  if (rootIds.length === 0) return terminalByRoot;
+
+  const { nodesById, edgesByIssueId } = await walkExplicitBlockerGraph(companyId, roots, dbOrTx);
 
   const collectTerminal = (
     issueId: string,

@@ -9,6 +9,8 @@ export type StatusCardFingerprintEntry = {
   title?: string;
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
+  /** Card owner's open Attention item ids anchored on this issue (MIR-376). */
+  attentionItemIds?: string[];
 };
 
 export type StatusCardFingerprint = Record<string, StatusCardFingerprintEntry>;
@@ -19,7 +21,7 @@ export type StatusCardDeltaChange = {
   title: string;
   from: string | null;
   to: string | null;
-  changeKind: "new" | "removed" | "status" | "assignee" | "human_comment" | "updated";
+  changeKind: "new" | "removed" | "status" | "assignee" | "human_comment" | "updated" | "attention";
 };
 
 /** Upper bound on summary-mentioned issues joined to a card's watched set. */
@@ -83,11 +85,45 @@ export function diffStatusCardFingerprint(previous: StatusCardFingerprint | null
     if (current[issueId]) continue;
     changes.push({ issueId, identifier: prior.identifier ?? issueId, title: prior.title ?? "", from: prior.status, to: null, changeKind: "removed" });
   }
-  return changes;
+  return [...changes, ...diffStatusCardAttention(before, current)];
+}
+
+/** First watched issue each owner Attention item is anchored on, keyed by item id. */
+function attentionAnchorByItemId(fingerprint: StatusCardFingerprint) {
+  const anchors = new Map<string, string>();
+  for (const [issueId, entry] of Object.entries(fingerprint)) {
+    for (const itemId of entry.attentionItemIds ?? []) {
+      if (!anchors.has(itemId)) anchors.set(itemId, issueId);
+    }
+  }
+  return anchors;
+}
+
+function attentionChange(fingerprint: StatusCardFingerprint, issueId: string, from: string | null, to: string | null): StatusCardDeltaChange {
+  const entry = fingerprint[issueId];
+  return { issueId, identifier: entry?.identifier ?? issueId, title: entry?.title ?? "", from, to, changeKind: "attention" };
+}
+
+/**
+ * Owner Attention items that appeared (`to` = item id) or resolved (`from` =
+ * item id) since the previous fingerprint. Compared by item id across the
+ * whole card, so an item that only moves between watched issues is no change.
+ */
+export function diffStatusCardAttention(previous: StatusCardFingerprint, current: StatusCardFingerprint) {
+  const before = attentionAnchorByItemId(previous);
+  const after = attentionAnchorByItemId(current);
+  const appeared = [...after].filter(([itemId]) => !before.has(itemId))
+    .map(([itemId, issueId]) => attentionChange(current, issueId, null, itemId));
+  const resolved = [...before].filter(([itemId]) => !after.has(itemId))
+    .map(([itemId, issueId]) => attentionChange(previous, issueId, itemId, null));
+  return [...appeared, ...resolved];
 }
 
 export function filterStatusCardChanges(changes: StatusCardDeltaChange[], policy: StatusCardRefreshPolicy) {
   return changes.filter((change) => {
+    // Something new or resolved waiting on the owner always refreshes the card,
+    // whatever its trigger settings (MIR-376).
+    if (change.changeKind === "attention") return true;
     if (policy.triggers.anyUpdate) return true;
     if ((change.changeKind === "new" || change.changeKind === "removed") && policy.triggers.membershipChanges) return true;
     if (change.changeKind === "assignee" && policy.triggers.assigneeChanges) return true;

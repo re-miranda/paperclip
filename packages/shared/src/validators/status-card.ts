@@ -63,6 +63,8 @@ export const statusCardFingerprintSchema = z.record(
     title: z.string().optional(),
     assigneeAgentId: z.string().guid().nullable().optional(),
     assigneeUserId: z.string().nullable().optional(),
+    // Card owner's open Attention item ids anchored on this issue (MIR-376).
+    attentionItemIds: z.array(z.string()).optional(),
   }),
 );
 

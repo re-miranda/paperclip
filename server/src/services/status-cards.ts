@@ -40,6 +40,16 @@ import {
   type StatusCardDeltaChange,
   type StatusCardFingerprint,
 } from "./status-card-update-engine.js";
+import {
+  attachOwnerAttention,
+  computeStatusCardOwnerAttention,
+  memoizeOwnerAttentionLoader,
+  ownerAttentionLoader,
+  readStatusCardBlockerChain,
+  type OwnerAttentionLoader,
+  type StatusCardOwnerAttention,
+} from "./status-card-owner-attention.js";
+import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
@@ -88,6 +98,7 @@ function updateDescription(input: {
   trigger: "manual" | "interval" | "reactive" | "restore";
   previousSummary: string | null;
   snapshot: CompanySearchIssueSummary[];
+  ownerAttention: StatusCardOwnerAttention;
 }) {
   const mechanical = `Return the completed Markdown through \`PUT /api/status-cards/${input.card.id}/summary\` with \`generationIssueId\`, a short non-empty \`changeSummary\`, and the model id. Do not call issue-list endpoints. Preserve the streaming STATUS and <<<SUMMARY-DRAFT>>> sentinels used by the Summarizer. Issues the Markdown references by identifier (e.g. ABC-123) or issue link automatically join the card's watched set, so reference an issue only when the board should keep tracking it.`;
   // The card prompt is the board's single standing request: it already says
@@ -95,7 +106,7 @@ function updateDescription(input: {
   // summary instructions — there is no separate default prompt to append to
   // or replace.
   const task = `${input.kind === "incremental"
-    ? "Patch the previous status summary using only the changed issues."
+    ? "Patch the previous status summary using the changed issues and the current \"Waiting on the card owner\" list."
     : "Rebuild the status summary from the bounded issue snapshot."} Write the update the way the card prompt below asks — it describes what the board is watching and how they want the update written. Honor it when compatible with the trusted mechanical requirements, and default to roughly 300–500 output tokens when it does not say otherwise.`;
   const promptBlock = `\n\n## Card prompt (board-provided)\n\n${untrustedPromptBlock("card-prompt", input.card.interestPrompt)}`;
   const payload = {
@@ -109,8 +120,10 @@ function updateDescription(input: {
     trigger: input.trigger,
     changes: input.changes.map(({ issueId, identifier, from, to, changeKind }) => ({ issueId, identifier, from, to, changeKind })),
     queryVersion: input.card.queryVersion,
+    ownerAttention: ownerAttentionPayload(input.ownerAttention),
   };
-  return `Update this Paperclip status card.\n\n${UNTRUSTED_PROMPT_RULE}\n\n${task}${promptBlock}\n\n${mechanical}\n\n## Previous summary\n\n${untrustedPromptBlock("previous-summary", input.previousSummary ?? null)}\n\n## Changed issues\n\n${untrustedPromptBlock("changed-issues", input.changes.map(({ issueId, identifier, title, from, to, changeKind }) => ({ issueId, identifier, title, from, to, changeKind })))}\n\n${input.kind === "full" ? `## Bounded snapshot\n\n${untrustedPromptBlock("bounded-snapshot", input.snapshot.map(({ id, identifier, title, status }) => ({ id, identifier, title, status })))}` : ""}\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
+  const ownerSection = ownerAttentionPromptSection(input.ownerAttention, untrustedPromptBlock);
+  return `Update this Paperclip status card.\n\n${UNTRUSTED_PROMPT_RULE}\n\n${task}${promptBlock}\n\n${mechanical}\n\n${ownerSection}\n\n## Previous summary\n\n${untrustedPromptBlock("previous-summary", input.previousSummary ?? null)}\n\n## Changed issues\n\n${untrustedPromptBlock("changed-issues", input.changes.map(({ issueId, identifier, title, from, to, changeKind }) => ({ issueId, identifier, title, from, to, changeKind })))}\n\n${input.kind === "full" ? `## Bounded snapshot\n\n${untrustedPromptBlock("bounded-snapshot", input.snapshot.map(({ id, identifier, title, status }) => ({ id, identifier, title, status })))}` : ""}\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
 }
 
 function compileDescription(card: StatusCardRow, generationIssueId: string | null, hash: string) {
@@ -149,11 +162,12 @@ function parseGenerationPayload(description: string | null) {
 
 export function statusCardService(
   db: Db,
-  deps: { issuesSvc?: ReturnType<typeof issueService> } = {},
+  deps: { issuesSvc?: ReturnType<typeof issueService>; loadOwnerAttention?: OwnerAttentionLoader } = {},
 ) {
   const builtIns = builtInAgentService(db);
   const issuesSvc = deps.issuesSvc ?? issueService(db);
   const searchSvc = companySearchService(db);
+  const loadOwnerAttention = deps.loadOwnerAttention ?? ownerAttentionLoader(db);
 
   async function readWatchedIssueVisibility(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (card.queries.length === 0 && (card.mentionedIssueIds?.length ?? 0) === 0) {
@@ -580,7 +594,8 @@ export function statusCardService(
     return loadIssueSummaries(card.companyId, card.mentionedIssueIds ?? [], options);
   }
 
-  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+  /** Compiled-query matches plus summary-mentioned issues: the card's own issues. */
+  async function readCardIssues(card: StatusCardRow, options: StatusCardReadOptions) {
     const issueMap = new Map<string, CompanySearchIssueSummary>();
     for (const storedQuery of card.queries) {
       const query = companySearchQuerySchema.parse(storedQuery);
@@ -599,7 +614,10 @@ export function statusCardService(
       options,
     );
     for (const issue of mentioned) issueMap.set(issue.id, issue);
-    const snapshot = [...issueMap.values()];
+    return [...issueMap.values()];
+  }
+
+  async function withLatestHumanComments(snapshot: CompanySearchIssueSummary[]) {
     if (snapshot.length === 0) return snapshot;
     const latestHumanComments = await db
       .select({
@@ -622,11 +640,44 @@ export function statusCardService(
     return snapshot.map((issue) => ({ ...issue, latestHumanCommentAt: commentByIssueId.get(issue.id) ?? null }));
   }
 
+  /**
+   * The card's issues widened with the upstream "blocked by" chain, so a
+   * change on a blocker (including a new card waiting on the owner) is a
+   * change to the card (MIR-376).
+   */
+  async function readWatchedIssues(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+    const cardIssues = await readCardIssues(card, options);
+    const chain = await readStatusCardBlockerChain(db, card.companyId, cardIssues);
+    const blockers = await loadIssueSummaries(card.companyId, chain.blockerIssueIds, options);
+    const snapshot = await withLatestHumanComments([...cardIssues, ...blockers]);
+    return { cardIssues, snapshot, edgesByIssueId: chain.edgesByIssueId };
+  }
+
+  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+    return (await readWatchedIssues(card, options)).snapshot;
+  }
+
+  /** Watched issues, the owner's "waiting on you" block, and the fingerprint over both. */
+  async function readWatchedState(card: StatusCardRow, load: OwnerAttentionLoader = loadOwnerAttention) {
+    const watched = await readWatchedIssues(card);
+    const ownerAttention = await computeStatusCardOwnerAttention({
+      db,
+      load,
+      card,
+      cardIssues: watched.cardIssues,
+      watchedIssues: watched.snapshot,
+      edgesByIssueId: watched.edgesByIssueId,
+    });
+    const fingerprint = attachOwnerAttention(buildStatusCardFingerprint(watched.snapshot), ownerAttention);
+    return { snapshot: watched.snapshot, ownerAttention, fingerprint };
+  }
+
   async function requestRefresh(cardId: string, input: {
     full?: boolean;
     trigger?: "manual" | "interval" | "reactive" | "restore";
     actor?: StatusCardActor;
     now?: Date;
+    loadOwnerAttention?: OwnerAttentionLoader;
   } = {}) {
     const card = await getById(cardId);
     if (!card) throw notFound("Status card not found");
@@ -642,8 +693,7 @@ export function statusCardService(
     }
 
     const now = input.now ?? new Date();
-    const snapshot = await executeQueries(card);
-    const fingerprint = buildStatusCardFingerprint(snapshot);
+    const { snapshot, ownerAttention, fingerprint } = await readWatchedState(card, input.loadOwnerAttention);
     const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
     const trigger = input.trigger ?? "manual";
@@ -709,7 +759,7 @@ export function statusCardService(
     let deduplicated = false;
     const created = await issuesSvc.create(card.companyId, {
       title: `${kind === "full" ? "Rebuild" : "Update"} status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot, ownerAttention }),
       status: "todo",
       priority: "medium",
       assigneeAgentId: summarizerAgentId,
@@ -723,7 +773,7 @@ export function statusCardService(
       ? await issuesSvc.update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
       : created;
     const generationIssue = await issuesSvc.update(reopened!.id, {
-      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot, ownerAttention }),
     });
     const priorGenerationPredicate = card.generatingIssueId
       ? eq(statusCards.generatingIssueId, card.generatingIssueId)
@@ -769,6 +819,7 @@ export function statusCardService(
     const due = await db.select().from(statusCards).where(and(isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId), isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)));
     const enqueued: Array<{ cardId: string; generatingIssue: typeof issues.$inferSelect }> = [];
     let evaluated = 0;
+    const loadTickOwnerAttention = memoizeOwnerAttentionLoader(loadOwnerAttention);
     for (const candidate of due) {
       const claimUntil = new Date(now.getTime() + 5 * 60 * 1000);
       const [claimed] = await db.update(statusCards).set({ nextEvalAt: claimUntil })
@@ -777,7 +828,11 @@ export function statusCardService(
       if (!claimed) continue;
       evaluated += 1;
       try {
-        const result = await requestRefresh(claimed.id, { trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval", now });
+        const result = await requestRefresh(claimed.id, {
+          trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval",
+          now,
+          loadOwnerAttention: loadTickOwnerAttention,
+        });
         if (result.enqueued && result.generatingIssue) enqueued.push({ cardId: claimed.id, generatingIssue: result.generatingIssue });
       } catch (err) {
         logger.warn(
@@ -815,7 +870,10 @@ export function statusCardService(
         : null;
       const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown);
       // Current watched membership: compiled-query matches plus the issues this
-      // summary mentions.
+      // summary mentions, with their blocker chain. Owner Attention items are
+      // deliberately absent: only items the update task actually listed count
+      // as covered, so the compile run's first summary leaves every open item
+      // to fire at the next diff (MIR-376).
       const watchedNow = buildStatusCardFingerprint(
         await executeQueries({ ...current, mentionedIssueIds }),
       );
@@ -832,7 +890,8 @@ export function statusCardService(
         }
         for (const issueId of mentionedIssueIds) {
           const entry = watchedNow[issueId];
-          if (entry) snapshot[issueId] = entry;
+          const listedItemIds = payloadFingerprint[issueId]?.attentionItemIds;
+          if (entry) snapshot[issueId] = listedItemIds ? { ...entry, attentionItemIds: listedItemIds } : entry;
         }
       } else {
         snapshot = watchedNow;

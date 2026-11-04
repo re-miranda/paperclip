@@ -20,6 +20,7 @@ import {
   statusCardUpdates,
 } from "@paperclipai/db";
 import {
+  type AttentionItem,
   defaultStatusCardRefreshPolicy,
   LOW_TRUST_REVIEW_PRESET,
   STATUS_CARD_AGENT_MAX_CARDS,
@@ -38,6 +39,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+
+/** An Attention desk with nothing waiting on anyone. */
+class EmptyAttentionDesk {
+  load = async (_companyId: string, _userId: string): Promise<AttentionItem[]> => [];
+}
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 type Db = ReturnType<typeof createDb>;
@@ -980,7 +986,9 @@ describeEmbeddedPostgres("status card routes", () => {
     await enableStatusCards();
     const summarizer = await seedSummarizer(company.id);
     const boardApp = createApp(db, localBoardActor());
-    const service = statusCardService(db);
+    // The blocked launch issue is itself an Attention item; keep the owner's
+    // desk empty so this test isolates mention tracking.
+    const service = statusCardService(db, { loadOwnerAttention: new EmptyAttentionDesk().load });
 
     const created = await request(boardApp)
       .post(`/api/companies/${company.id}/status-cards`)
