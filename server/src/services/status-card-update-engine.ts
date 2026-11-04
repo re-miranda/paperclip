@@ -89,7 +89,7 @@ export function diffStatusCardFingerprint(previous: StatusCardFingerprint | null
 }
 
 /** First watched issue each owner Attention item is anchored on, keyed by item id. */
-function attentionAnchorByItemId(fingerprint: StatusCardFingerprint) {
+function attentionAnchorByItemId(fingerprint: StatusCardFingerprint): Map<string, string> {
   const anchors = new Map<string, string>();
   for (const [issueId, entry] of Object.entries(fingerprint)) {
     for (const itemId of entry.attentionItemIds ?? []) {
@@ -108,8 +108,12 @@ function attentionChange(fingerprint: StatusCardFingerprint, issueId: string, fr
  * Owner Attention items that appeared (`to` = item id) or resolved (`from` =
  * item id) since the previous fingerprint. Compared by item id across the
  * whole card, so an item that only moves between watched issues is no change.
+ *
+ * @example
+ * diffStatusCardAttention({ a: { ...entry, attentionItemIds: ["x"] } }, { a: entry });
+ * // [{ issueId: "a", from: "x", to: null, changeKind: "attention", ... }]
  */
-export function diffStatusCardAttention(previous: StatusCardFingerprint, current: StatusCardFingerprint) {
+export function diffStatusCardAttention(previous: StatusCardFingerprint, current: StatusCardFingerprint): StatusCardDeltaChange[] {
   const before = attentionAnchorByItemId(previous);
   const after = attentionAnchorByItemId(current);
   const appeared = [...after].filter(([itemId]) => !before.has(itemId))

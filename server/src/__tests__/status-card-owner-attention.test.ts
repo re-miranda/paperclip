@@ -34,6 +34,11 @@ class CountingAttentionLoader {
   };
 }
 
+/** Stands in for the untrusted-data quoting of status-cards.ts. */
+function quote(label: string, value: unknown): string {
+  return `<${label}>${JSON.stringify(value)}</${label}>`;
+}
+
 const watched = (id: string, status = "blocked") => ({ id, identifier: id, status: status as "blocked" });
 
 describe("status card owner attention", () => {
@@ -102,13 +107,11 @@ describe("status card owner attention", () => {
   });
 
   it("tells the summarizer when a card has no owner", () => {
-    const quote = (label: string, value: unknown) => `<${label}>${JSON.stringify(value)}</${label}>`;
     expect(ownerAttentionPromptSection({ owner: "none" }, quote)).toContain("has no owner");
     expect(ownerAttentionPayload({ owner: "none" })).toEqual({ owner: "none" });
   });
 
   it("puts item titles in the untrusted block and the elsewhere link in the instructions", () => {
-    const quote = (label: string, value: unknown) => `<${label}>${JSON.stringify(value)}</${label}>`;
     const attention: StatusCardOwnerAttention = {
       owner: "user", userId: "u", elsewhereCount: 2, attentionHref: "/MIR/decisions",
       items: [{ itemId: "x", title: "Run the prepared tailscale command", sourceKind: "issue_thread_interaction", href: null, issueId: "A", identifier: "MIR-374", holdsUpCount: 1, heldUpIdentifiers: ["MIR-317"] }],

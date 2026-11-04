@@ -3696,10 +3696,72 @@ export type ExplicitBlockerGraph = {
   edgesByIssueId: Map<string, string[]>;
 };
 
+type ExplicitBlockerRow = IssueRelationSummaryRow & { currentIssueId: string };
+
+/**
+ * Unresolved explicit blockers of `issueIds`. With a `rowLimit` the rows come
+ * in a stable order, so a capped walk picks the same blockers on every run.
+ */
+async function selectUnresolvedBlockerRows(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueIds: string[],
+  rowLimit: number | null,
+): Promise<ExplicitBlockerRow[]> {
+  const query = dbOrTx
+    .select({
+      currentIssueId: issueRelations.relatedIssueId,
+      relatedId: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      status: issues.status,
+      priority: issues.priority,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, issueIds),
+        eq(issues.companyId, companyId),
+        ne(issues.status, "done"),
+      ),
+    )
+    .$dynamic();
+  if (rowLimit === null) return query;
+  return query.orderBy(asc(issueRelations.relatedIssueId), asc(issues.id)).limit(rowLimit);
+}
+
+/** Adds edges and newly reached blockers; past `maxNodes` new blockers are dropped. */
+function recordBlockerRows(
+  graph: ExplicitBlockerGraph,
+  rows: ExplicitBlockerRow[],
+  nextFrontier: Set<string>,
+  maxNodes: number,
+): void {
+  for (const row of rows) {
+    const known = graph.nodesById.has(row.relatedId);
+    if (!known && graph.nodesById.size >= maxNodes) continue;
+    const existingEdges = graph.edgesByIssueId.get(row.currentIssueId) ?? [];
+    if (!existingEdges.includes(row.relatedId)) {
+      existingEdges.push(row.relatedId);
+      graph.edgesByIssueId.set(row.currentIssueId, existingEdges);
+    }
+    if (known) continue;
+    graph.nodesById.set(row.relatedId, summarizeIssueRelationRow(row));
+    nextFrontier.add(row.relatedId);
+  }
+}
+
 /**
  * Walk explicit `blocks` relations upstream from `roots`, skipping blockers
  * that are already done. Bounded by the blocker-attention depth and node caps,
- * so cycles and very large graphs stay cheap.
+ * so cycles and very large graphs stay cheap. `maxNodes` (roots included) is a
+ * hard bound: each query fetches at most that many rows and no node is added
+ * past it.
  *
  * @example
  * const graph = await walkExplicitBlockerGraph(companyId, [blockedIssue], db);
@@ -3709,64 +3771,22 @@ export async function walkExplicitBlockerGraph(
   companyId: string,
   roots: IssueRelationIssueSummary[],
   dbOrTx: Pick<Db, "select">,
+  options: { maxNodes?: number } = {},
 ): Promise<ExplicitBlockerGraph> {
-  const rootIds = [...new Set(roots.map((root) => root.id))];
-  const nodesById = new Map<string, IssueRelationIssueSummary>();
-  const edgesByIssueId = new Map<string, string[]>();
-  for (const root of roots) nodesById.set(root.id, root);
-
-  let frontier = rootIds;
-  for (
-    let depth = 0;
-    frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH;
-    depth += 1
-  ) {
+  const graph: ExplicitBlockerGraph = { nodesById: new Map(), edgesByIssueId: new Map() };
+  for (const root of roots) graph.nodesById.set(root.id, root);
+  const rowLimit = options.maxNodes ?? null;
+  let frontier = [...graph.nodesById.keys()];
+  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
     const nextFrontier = new Set<string>();
-    for (const chunk of chunkList(
-      [...new Set(frontier)],
-      ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
-    )) {
-      const rows = await dbOrTx
-        .select({
-          currentIssueId: issueRelations.relatedIssueId,
-          relatedId: issues.id,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          priority: issues.priority,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-        })
-        .from(issueRelations)
-        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
-        .where(
-          and(
-            eq(issueRelations.companyId, companyId),
-            eq(issueRelations.type, "blocks"),
-            inArray(issueRelations.relatedIssueId, chunk),
-            eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
-          ),
-        );
-
-      for (const row of rows) {
-        const existingEdges = edgesByIssueId.get(row.currentIssueId) ?? [];
-        if (!existingEdges.includes(row.relatedId)) {
-          existingEdges.push(row.relatedId);
-          edgesByIssueId.set(row.currentIssueId, existingEdges);
-        }
-        if (!nodesById.has(row.relatedId)) {
-          nodesById.set(row.relatedId, summarizeIssueRelationRow(row));
-          nextFrontier.add(row.relatedId);
-        }
-      }
+    for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      const rows = await selectUnresolvedBlockerRows(dbOrTx, companyId, chunk, rowLimit);
+      recordBlockerRows(graph, rows, nextFrontier, options.maxNodes ?? Number.POSITIVE_INFINITY);
     }
-
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) break;
+    if (graph.nodesById.size > BLOCKER_ATTENTION_MAX_NODES) break;
     frontier = [...nextFrontier];
   }
-
-  return { nodesById, edgesByIssueId };
+  return graph;
 }
 
 async function terminalExplicitBlockersByRoot(

@@ -1,7 +1,8 @@
-import { eq } from "drizzle-orm";
-import { companies, type Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { companies, issues, type Db } from "@paperclipai/db";
 import type { AttentionItem, AttentionSourceKind, CompanySearchIssueSummary } from "@paperclipai/shared";
 import { attentionService } from "./attention.js";
+import { issueReadSqlCondition } from "./authorization.js";
 import { attentionItemIssueIds } from "./decision-queues.js";
 import { walkExplicitBlockerGraph } from "./issues.js";
 import type { StatusCardFingerprint } from "./status-card-update-engine.js";
@@ -43,12 +44,19 @@ export type StatusCardOwnerAttention =
 /** Loads one user's Attention desk items, already in the desk's own order. */
 export type OwnerAttentionLoader = (companyId: string, userId: string) => Promise<AttentionItem[]>;
 
-/** The card's own issues plus the upstream blockers they wait on. */
+/**
+ * The card's own issues plus the upstream blockers they wait on. Only issues
+ * every company member can read take part: the update task and the stored
+ * fingerprint are readable company-wide, so private blockers and the
+ * Attention items on them must never reach either (MIR-391).
+ */
 export type StatusCardBlockerChain = {
-  /** Issue id -> ids of the unresolved issues blocking it. */
+  /** Issue id -> ids of the unresolved issues blocking it, both company-visible. */
   edgesByIssueId: Map<string, string[]>;
-  /** Upstream blockers that are not card issues, nearest first, capped. */
+  /** Company-visible upstream blockers that are not card issues. */
   blockerIssueIds: string[];
+  /** Company-visible card issues and blockers: the owner block's whole scope. */
+  visibleIssueIds: Set<string>;
 };
 
 export type WatchedIssueRef = Pick<CompanySearchIssueSummary, "id" | "identifier" | "status">;
@@ -90,8 +98,35 @@ export function memoizeOwnerAttentionLoader(load: OwnerAttentionLoader): OwnerAt
 }
 
 /**
- * Walks "blocked by" links upstream from the card's open issues, reusing the
- * issue service's bounded blocker walk.
+ * Of `issueIds`, those every company member may read (no private issue or
+ * private project on their privacy chain).
+ *
+ * @example
+ * await companyVisibleIssueIds(db, companyId, [publicId, privateId]); // Set {publicId}
+ */
+export async function companyVisibleIssueIds(db: Db, companyId: string, issueIds: string[]): Promise<Set<string>> {
+  if (issueIds.length === 0) return new Set();
+  const visibleToEveryone = await issueReadSqlCondition(db, { type: "none" });
+  const rows = await db.select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds), visibleToEveryone));
+  return new Set(rows.map((row) => row.id));
+}
+
+/** Drops every edge that touches an issue outside `allowed`. */
+function pruneBlockerEdges(edgesByIssueId: ReadonlyMap<string, string[]>, allowed: ReadonlySet<string>): Map<string, string[]> {
+  const pruned = new Map<string, string[]>();
+  for (const [issueId, blockerIds] of edgesByIssueId) {
+    if (!allowed.has(issueId)) continue;
+    pruned.set(issueId, blockerIds.filter((blockerId) => allowed.has(blockerId)));
+  }
+  return pruned;
+}
+
+/**
+ * Walks "blocked by" links upstream from the card's open, company-visible
+ * issues with the issue service's blocker walk, capped at
+ * STATUS_CARD_MAX_BLOCKER_ISSUES new issues. Private issues end the chain.
  *
  * @example
  * const chain = await readStatusCardBlockerChain(db, companyId, cardIssues);
@@ -101,14 +136,16 @@ export async function readStatusCardBlockerChain(
   companyId: string,
   cardIssues: CompanySearchIssueSummary[],
 ): Promise<StatusCardBlockerChain> {
-  const openIssues = cardIssues.filter((issue) => !CLOSED_ISSUE_STATUSES.has(issue.status));
-  if (openIssues.length === 0) return { edgesByIssueId: new Map(), blockerIssueIds: [] };
-  const graph = await walkExplicitBlockerGraph(companyId, openIssues, db);
+  const visibleCardIds = await companyVisibleIssueIds(db, companyId, cardIssues.map((issue) => issue.id));
+  const roots = cardIssues.filter((issue) => visibleCardIds.has(issue.id) && !CLOSED_ISSUE_STATUSES.has(issue.status));
+  const graph = await walkExplicitBlockerGraph(companyId, roots, db, { maxNodes: roots.length + STATUS_CARD_MAX_BLOCKER_ISSUES });
   const cardIssueIds = new Set(cardIssues.map((issue) => issue.id));
-  const blockerIssueIds = [...graph.nodesById.keys()]
-    .filter((issueId) => !cardIssueIds.has(issueId))
-    .slice(0, STATUS_CARD_MAX_BLOCKER_ISSUES);
-  return { edgesByIssueId: graph.edgesByIssueId, blockerIssueIds };
+  const candidateIds = [...graph.nodesById.keys()].filter((issueId) => !cardIssueIds.has(issueId));
+  const allowed = new Set([...visibleCardIds, ...await companyVisibleIssueIds(db, companyId, candidateIds)]);
+  const edgesByIssueId = pruneBlockerEdges(graph.edgesByIssueId, allowed);
+  const reachable = new Set(roots.flatMap((root) => [...upstreamIssueIds(root.id, edgesByIssueId)]));
+  const blockerIssueIds = [...reachable].filter((issueId) => !cardIssueIds.has(issueId));
+  return { edgesByIssueId, blockerIssueIds, visibleIssueIds: new Set([...visibleCardIds, ...blockerIssueIds]) };
 }
 
 /**
@@ -139,7 +176,7 @@ export type StatusCardAttentionRankInput = {
 
 type RankedEntry = { entry: StatusCardAttentionEntry; deskRank: number };
 
-function heldUpIssues(anchors: string[], closures: Array<{ issue: WatchedIssueRef; ids: Set<string> }>) {
+function heldUpIssues(anchors: string[], closures: Array<{ issue: WatchedIssueRef; ids: Set<string> }>): WatchedIssueRef[] {
   return closures
     .filter((closure) => anchors.some((anchor) => closure.ids.has(anchor)))
     .map((closure) => closure.issue);
@@ -161,7 +198,7 @@ function toRankedEntry(item: AttentionItem, issue: WatchedIssueRef, heldUp: Watc
   };
 }
 
-function compareRankedEntries(left: RankedEntry, right: RankedEntry) {
+function compareRankedEntries(left: RankedEntry, right: RankedEntry): number {
   const weightDiff = right.entry.holdsUpCount - left.entry.holdsUpCount;
   return weightDiff !== 0 ? weightDiff : left.deskRank - right.deskRank;
 }
@@ -169,13 +206,17 @@ function compareRankedEntries(left: RankedEntry, right: RankedEntry) {
 /**
  * Keeps the owner's items that sit on a watched issue (the card's issues or
  * their blocker chain), ranked by how many of the card's open issues each
- * holds up, then by the Attention desk's own order. The rest only count.
+ * holds up, then by the Attention desk's own order. The rest only count;
+ * callers pass company-visible issues only, so items on private issues count
+ * as "elsewhere" and never show a title.
  *
  * @example
  * rankStatusCardOwnerAttention({ items, cardIssues, watchedIssues, edgesByIssueId });
  * // { items: [{ identifier: "MIR-374", holdsUpCount: 2, ... }], elsewhereCount: 3 }
  */
-export function rankStatusCardOwnerAttention(input: StatusCardAttentionRankInput) {
+export function rankStatusCardOwnerAttention(
+  input: StatusCardAttentionRankInput,
+): { items: StatusCardAttentionEntry[]; elsewhereCount: number } {
   const closures = input.cardIssues
     .filter((issue) => !CLOSED_ISSUE_STATUSES.has(issue.status))
     .map((issue) => ({ issue, ids: upstreamIssueIds(issue.id, input.edgesByIssueId) }));
@@ -215,7 +256,7 @@ export function attachOwnerAttention(
   return next;
 }
 
-async function attentionDeskHref(db: Db, companyId: string) {
+async function attentionDeskHref(db: Db, companyId: string): Promise<string> {
   const company = await db.select({ issuePrefix: companies.issuePrefix })
     .from(companies)
     .where(eq(companies.id, companyId))

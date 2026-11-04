@@ -27,6 +27,7 @@ import {
 import { companySearchQuerySchema, statusCardRefreshPolicySchema } from "@paperclipai/shared";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { attentionService } from "../services/attention.js";
+import { readStatusCardBlockerChain, STATUS_CARD_MAX_BLOCKER_ISSUES } from "../services/status-card-owner-attention.js";
 import { statusCardService } from "../services/status-cards.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -114,6 +115,14 @@ describeEmbeddedPostgres("status card owner attention", () => {
 
   async function seedIssue(companyId: string, identifier: string, title: string, status: string) {
     return db.insert(issues).values({ companyId, identifier, title, status, priority: "medium" }).returning().then((rows) => rows[0]!);
+  }
+
+  async function seedPrivateIssue(companyId: string, identifier: string, title: string) {
+    const id = randomUUID();
+    return db.insert(issues).values({
+      id, companyId, identifier, title, status: "todo", priority: "medium",
+      visibility: "private", privacyRootIssueId: id, responsibleUserId: OWNER_USER_ID,
+    }).returning().then((rows) => rows[0]!);
   }
 
   async function seedBlock(companyId: string, blockerId: string, blockedId: string) {
@@ -285,5 +294,48 @@ describeEmbeddedPostgres("status card owner attention", () => {
 
     expect(readUpdatePayload(result.generatingIssue!.description).ownerAttention).toEqual({ owner: "none" });
     expect(result.generatingIssue!.description).toContain("has no owner");
+  });
+
+  it("keeps private blockers and their cards out of the company-readable task and snapshot", async () => {
+    const { company, summarizer, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const privateBlocker = await seedPrivateIssue(company.id, `${issuePrefix}-374`, "Confidential vendor dispute");
+    const behindPrivate = await seedIssue(company.id, `${issuePrefix}-375`, "Public step behind the private one", "todo");
+    await seedBlock(company.id, privateBlocker.id, watched.id);
+    await seedBlock(company.id, behindPrivate.id, privateBlocker.id);
+    await seedHumanOnlyCard(company.id, privateBlocker.id, "Secret question for the owner", new Date());
+    const card = await seedCard(company.id, OWNER_USER_ID);
+
+    const result = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+
+    const description = result.generatingIssue!.description!;
+    for (const secret of ["Confidential vendor dispute", "Secret question for the owner", privateBlocker.id, privateBlocker.identifier!]) {
+      expect(description).not.toContain(secret);
+    }
+    expect(description).not.toContain(behindPrivate.identifier!);
+    const attention = listedItems(description);
+    expect(attention.items).toEqual([]);
+    expect(attention.elsewhereCount).toBeGreaterThanOrEqual(1);
+    await writeSummary(card.id, result.generatingIssue!.id, summarizer.id, company.id);
+    const stored = await db.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0]!);
+    expect(Object.keys(stored.fingerprint ?? {})).toEqual([watched.id]);
+  });
+
+  it("bounds the blocker walk itself, not only the watched list", async () => {
+    const { company, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const blockerCount = STATUS_CARD_MAX_BLOCKER_ISSUES + 50;
+    const blockers = await db.insert(issues).values(Array.from({ length: blockerCount }, (_, index) => ({
+      companyId: company.id, identifier: `${issuePrefix}-${1000 + index}`, title: `Dependency ${index}`, status: "todo", priority: "medium",
+    }))).returning();
+    await db.insert(issueRelations).values(blockers.map((blocker) => ({
+      companyId: company.id, issueId: blocker.id, relatedIssueId: watched.id, type: "blocks",
+    })));
+    const root = { ...watched, status: "blocked" as const, priority: "medium" as const, updatedAt: watched.updatedAt.toISOString() };
+
+    const chain = await readStatusCardBlockerChain(db, company.id, [root]);
+
+    expect(chain.blockerIssueIds).toHaveLength(STATUS_CARD_MAX_BLOCKER_ISSUES);
+    expect(chain.edgesByIssueId.get(watched.id)!.length).toBeLessThanOrEqual(STATUS_CARD_MAX_BLOCKER_ISSUES);
   });
 });

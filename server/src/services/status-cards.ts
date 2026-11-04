@@ -47,6 +47,7 @@ import {
   ownerAttentionLoader,
   readStatusCardBlockerChain,
   type OwnerAttentionLoader,
+  type StatusCardBlockerChain,
   type StatusCardOwnerAttention,
 } from "./status-card-owner-attention.js";
 import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
@@ -55,6 +56,17 @@ type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
 type StatusCardRow = typeof statusCards.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
+type WatchedIssueSummary = CompanySearchIssueSummary & { latestHumanCommentAt?: string | null };
+type StatusCardWatchedIssues = {
+  cardIssues: CompanySearchIssueSummary[];
+  snapshot: WatchedIssueSummary[];
+  chain: StatusCardBlockerChain;
+};
+type StatusCardWatchedState = {
+  snapshot: WatchedIssueSummary[];
+  ownerAttention: StatusCardOwnerAttention;
+  fingerprint: StatusCardFingerprint;
+};
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
@@ -595,7 +607,7 @@ export function statusCardService(
   }
 
   /** Compiled-query matches plus summary-mentioned issues: the card's own issues. */
-  async function readCardIssues(card: StatusCardRow, options: StatusCardReadOptions) {
+  async function readCardIssues(card: StatusCardRow, options: StatusCardReadOptions): Promise<CompanySearchIssueSummary[]> {
     const issueMap = new Map<string, CompanySearchIssueSummary>();
     for (const storedQuery of card.queries) {
       const query = companySearchQuerySchema.parse(storedQuery);
@@ -617,7 +629,7 @@ export function statusCardService(
     return [...issueMap.values()];
   }
 
-  async function withLatestHumanComments(snapshot: CompanySearchIssueSummary[]) {
+  async function withLatestHumanComments(snapshot: CompanySearchIssueSummary[]): Promise<WatchedIssueSummary[]> {
     if (snapshot.length === 0) return snapshot;
     const latestHumanComments = await db
       .select({
@@ -645,28 +657,32 @@ export function statusCardService(
    * change on a blocker (including a new card waiting on the owner) is a
    * change to the card (MIR-376).
    */
-  async function readWatchedIssues(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+  async function readWatchedIssues(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<StatusCardWatchedIssues> {
     const cardIssues = await readCardIssues(card, options);
     const chain = await readStatusCardBlockerChain(db, card.companyId, cardIssues);
     const blockers = await loadIssueSummaries(card.companyId, chain.blockerIssueIds, options);
     const snapshot = await withLatestHumanComments([...cardIssues, ...blockers]);
-    return { cardIssues, snapshot, edgesByIssueId: chain.edgesByIssueId };
+    return { cardIssues, snapshot, chain };
   }
 
-  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<WatchedIssueSummary[]> {
     return (await readWatchedIssues(card, options)).snapshot;
   }
 
   /** Watched issues, the owner's "waiting on you" block, and the fingerprint over both. */
-  async function readWatchedState(card: StatusCardRow, load: OwnerAttentionLoader = loadOwnerAttention) {
+  async function readWatchedState(
+    card: StatusCardRow,
+    load: OwnerAttentionLoader = loadOwnerAttention,
+  ): Promise<StatusCardWatchedState> {
     const watched = await readWatchedIssues(card);
+    const companyVisible = (issue: CompanySearchIssueSummary) => watched.chain.visibleIssueIds.has(issue.id);
     const ownerAttention = await computeStatusCardOwnerAttention({
       db,
       load,
       card,
-      cardIssues: watched.cardIssues,
-      watchedIssues: watched.snapshot,
-      edgesByIssueId: watched.edgesByIssueId,
+      cardIssues: watched.cardIssues.filter(companyVisible),
+      watchedIssues: watched.snapshot.filter(companyVisible),
+      edgesByIssueId: watched.chain.edgesByIssueId,
     });
     const fingerprint = attachOwnerAttention(buildStatusCardFingerprint(watched.snapshot), ownerAttention);
     return { snapshot: watched.snapshot, ownerAttention, fingerprint };
