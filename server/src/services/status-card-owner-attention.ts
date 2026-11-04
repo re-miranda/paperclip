@@ -172,6 +172,8 @@ export type StatusCardAttentionRankInput = {
   cardIssues: WatchedIssueRef[];
   watchedIssues: ReadonlyMap<string, WatchedIssueRef>;
   edgesByIssueId: ReadonlyMap<string, string[]>;
+  /** Issues every company member can read; an item listed must touch no other issue. */
+  companyVisibleIssueIds: ReadonlySet<string>;
 };
 
 type RankedEntry = { entry: StatusCardAttentionEntry; deskRank: number };
@@ -206,12 +208,13 @@ function compareRankedEntries(left: RankedEntry, right: RankedEntry): number {
 /**
  * Keeps the owner's items that sit on a watched issue (the card's issues or
  * their blocker chain), ranked by how many of the card's open issues each
- * holds up, then by the Attention desk's own order. The rest only count;
- * callers pass company-visible issues only, so items on private issues count
- * as "elsewhere" and never show a title.
+ * holds up, then by the Attention desk's own order. The rest only count. An
+ * item that touches any private issue (as subject or related issue) is
+ * counted, never listed, so no private title or link reaches the
+ * company-readable update task (MIR-394).
  *
  * @example
- * rankStatusCardOwnerAttention({ items, cardIssues, watchedIssues, edgesByIssueId });
+ * rankStatusCardOwnerAttention({ items, cardIssues, watchedIssues, edgesByIssueId, companyVisibleIssueIds });
  * // { items: [{ identifier: "MIR-374", holdsUpCount: 2, ... }], elsewhereCount: 3 }
  */
 export function rankStatusCardOwnerAttention(
@@ -225,7 +228,7 @@ export function rankStatusCardOwnerAttention(
   for (const item of input.items) {
     const anchors = attentionItemIssueIds(item);
     const watched = anchors.map((anchor) => input.watchedIssues.get(anchor)).find(Boolean);
-    if (!watched) {
+    if (!watched || !anchors.every((anchor) => input.companyVisibleIssueIds.has(anchor))) {
       elsewhereCount += 1;
       continue;
     }
@@ -287,11 +290,17 @@ export async function computeStatusCardOwnerAttention(input: StatusCardOwnerAtte
     input.load(input.card.companyId, userId),
     attentionDeskHref(input.db, input.card.companyId),
   ]);
+  const watchedIssues = new Map(input.watchedIssues.map((issue) => [issue.id, issue]));
+  // Only items already touching a watched issue can be listed, so only their anchors need a visibility check.
+  const anchorIds = [...new Set(items.map(attentionItemIssueIds)
+    .filter((anchors) => anchors.some((anchor) => watchedIssues.has(anchor)))
+    .flat())];
   const ranked = rankStatusCardOwnerAttention({
     items,
     cardIssues: input.cardIssues,
-    watchedIssues: new Map(input.watchedIssues.map((issue) => [issue.id, issue])),
+    watchedIssues,
     edgesByIssueId: input.edgesByIssueId,
+    companyVisibleIssueIds: await companyVisibleIssueIds(input.db, input.card.companyId, anchorIds),
   });
   return { owner: "user", userId, attentionHref, ...ranked };
 }

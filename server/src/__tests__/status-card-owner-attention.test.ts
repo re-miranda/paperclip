@@ -39,7 +39,9 @@ function quote(label: string, value: unknown): string {
   return `<${label}>${JSON.stringify(value)}</${label}>`;
 }
 
-const watched = (id: string, status = "blocked") => ({ id, identifier: id, status: status as "blocked" });
+function watched(id: string, status = "blocked"): { id: string; identifier: string; status: "blocked" } {
+  return { id, identifier: id, status: status as "blocked" };
+}
 
 describe("status card owner attention", () => {
   it("walks every hop upstream and survives cycles", () => {
@@ -58,6 +60,7 @@ describe("status card owner attention", () => {
       cardIssues: [watched("B")],
       watchedIssues: new Map([["B", watched("B")], ["A", watched("A", "todo")]]),
       edgesByIssueId: new Map([["B", ["A"]]]),
+      companyVisibleIssueIds: new Set(["A", "B", "U"]),
     });
 
     expect(ranked.items.map((item) => [item.itemId, item.identifier, item.heldUpIdentifiers])).toEqual([
@@ -76,6 +79,7 @@ describe("status card owner attention", () => {
       cardIssues: [watched("B1"), watched("B2"), watched("B3"), watched("Closed", "done")],
       watchedIssues: new Map(["A", "C", "B1", "B2", "B3", "Closed"].map((id) => [id, watched(id)])),
       edgesByIssueId: new Map([["B1", ["A"]], ["B2", ["A"]], ["B3", ["C"]], ["Closed", ["C"]]]),
+      companyVisibleIssueIds: new Set(["A", "C", "B1", "B2", "B3", "Closed"]),
     });
 
     expect(ranked.items.map((item) => [item.itemId, item.holdsUpCount])).toEqual([
@@ -83,6 +87,20 @@ describe("status card owner attention", () => {
       ["small-first-on-desk", 1],
       ["small-later-on-desk", 1],
     ]);
+  });
+
+  it("counts, never lists, a desk item whose subject is a private blocker of a public card issue", () => {
+    const privateSubject = { ...issueSubjectFixture("Private"), title: "Confidential vendor dispute" };
+    const blockerItem = { id: "blocker", rank: 1, sourceKind: "blocker_attention", subject: privateSubject, relatedIssue: issueSubjectFixture("B") } as AttentionItem;
+    const ranked = rankStatusCardOwnerAttention({
+      items: [blockerItem],
+      cardIssues: [watched("B")],
+      watchedIssues: new Map([["B", watched("B")]]),
+      edgesByIssueId: new Map(),
+      companyVisibleIssueIds: new Set(["B"]),
+    });
+
+    expect(ranked).toEqual({ items: [], elsewhereCount: 1 });
   });
 
   it("stores listed item ids on the issue they sit on", () => {

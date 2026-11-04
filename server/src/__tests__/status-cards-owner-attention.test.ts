@@ -24,7 +24,7 @@ import {
   statusCards,
   statusCardUpdates,
 } from "@paperclipai/db";
-import { companySearchQuerySchema, statusCardRefreshPolicySchema } from "@paperclipai/shared";
+import { companySearchQuerySchema, statusCardRefreshPolicySchema, type CompanySearchIssueSummary } from "@paperclipai/shared";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { attentionService } from "../services/attention.js";
 import { readStatusCardBlockerChain, STATUS_CARD_MAX_BLOCKER_ISSUES } from "../services/status-card-owner-attention.js";
@@ -117,12 +117,16 @@ describeEmbeddedPostgres("status card owner attention", () => {
     return db.insert(issues).values({ companyId, identifier, title, status, priority: "medium" }).returning().then((rows) => rows[0]!);
   }
 
-  async function seedPrivateIssue(companyId: string, identifier: string, title: string) {
+  async function seedPrivateIssue(companyId: string, identifier: string, title: string, status = "todo") {
     const id = randomUUID();
     return db.insert(issues).values({
-      id, companyId, identifier, title, status: "todo", priority: "medium",
+      id, companyId, identifier, title, status, priority: "medium",
       visibility: "private", privacyRootIssueId: id, responsibleUserId: OWNER_USER_ID,
     }).returning().then((rows) => rows[0]!);
+  }
+
+  function asSearchSummary(issue: typeof issues.$inferSelect): CompanySearchIssueSummary {
+    return { ...issue, status: issue.status as "blocked", priority: issue.priority as "medium", updatedAt: issue.updatedAt.toISOString() };
   }
 
   async function seedBlock(companyId: string, blockerId: string, blockedId: string) {
@@ -331,11 +335,50 @@ describeEmbeddedPostgres("status card owner attention", () => {
     await db.insert(issueRelations).values(blockers.map((blocker) => ({
       companyId: company.id, issueId: blocker.id, relatedIssueId: watched.id, type: "blocks",
     })));
-    const root = { ...watched, status: "blocked" as const, priority: "medium" as const, updatedAt: watched.updatedAt.toISOString() };
 
-    const chain = await readStatusCardBlockerChain(db, company.id, [root]);
+    const chain = await readStatusCardBlockerChain(db, company.id, [asSearchSummary(watched)]);
 
     expect(chain.blockerIssueIds).toHaveLength(STATUS_CARD_MAX_BLOCKER_ISSUES);
     expect(chain.edgesByIssueId.get(watched.id)!.length).toBeLessThanOrEqual(STATUS_CARD_MAX_BLOCKER_ISSUES);
+  });
+
+  it("keeps every edge of blockers shared by several card issues within the budget", async () => {
+    const { company, issuePrefix } = await seedCompany();
+    const first = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire part 1", "blocked");
+    const second = await seedIssue(company.id, `${issuePrefix}-318`, "Rosana questionnaire part 2", "blocked");
+    const shared = await db.insert(issues).values(Array.from({ length: 150 }, (_, index) => ({
+      companyId: company.id, identifier: `${issuePrefix}-${2000 + index}`, title: `Shared dependency ${index}`, status: "todo", priority: "medium",
+    }))).returning();
+    await db.insert(issueRelations).values([first, second].flatMap((root) => shared.map((blocker) => ({
+      companyId: company.id, issueId: blocker.id, relatedIssueId: root.id, type: "blocks",
+    }))));
+
+    const chain = await readStatusCardBlockerChain(db, company.id, [asSearchSummary(first), asSearchSummary(second)]);
+
+    expect(chain.blockerIssueIds).toHaveLength(150);
+    expect(chain.edgesByIssueId.get(first.id)).toHaveLength(150);
+    expect(chain.edgesByIssueId.get(second.id)).toHaveLength(150);
+  });
+
+  it("never lists a desk item whose subject is a private blocker, even when it names a public card issue", async () => {
+    const { company, summarizer, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const privateBlocker = await seedPrivateIssue(company.id, `${issuePrefix}-374`, "Confidential vendor dispute", "in_review");
+    await seedBlock(company.id, privateBlocker.id, watched.id);
+    const card = await seedCard(company.id, OWNER_USER_ID);
+    const feed = await attentionService(db).list(company.id, { userId: OWNER_USER_ID, all: true, allowUnscopedAll: true });
+    // Precondition: the owner's desk really holds a two-anchor item, private subject and public related issue.
+    expect(feed.items.some((item) => item.subject.id === privateBlocker.id && item.relatedIssue?.id === watched.id)).toBe(true);
+
+    const result = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+
+    const description = result.generatingIssue!.description!;
+    for (const secret of ["Confidential vendor dispute", privateBlocker.id, privateBlocker.identifier!]) {
+      expect(description).not.toContain(secret);
+    }
+    expect(listedItems(description).items).toEqual([]);
+    await writeSummary(card.id, result.generatingIssue!.id, summarizer.id, company.id);
+    const stored = await db.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0]!);
+    expect(JSON.stringify(stored.fingerprint)).not.toContain(privateBlocker.id);
   });
 });
