@@ -160,7 +160,16 @@ export function statusCardAttentionFixtures(getDb: () => Db) {
     return feed.items.find((item) => item.subject.id === interactionId)!.id;
   }
 
-  async function writeSummary(cardId: string, generationIssueId: string, summarizerId: string, companyId: string, markdown = "Summary.") {
+  /** A summary that opens with every Attention item the task listed, as the write-back guard requires. */
+  async function summaryListingTaskItems(generationIssueId: string): Promise<string> {
+    const task = await getDb().select().from(issues).where(eq(issues.id, generationIssueId)).then((rows) => rows[0]!);
+    const attention = readUpdatePayload(task.description).ownerAttention;
+    const identifiers = attention.owner === "user" ? attention.items.map((item) => item.identifier) : [];
+    return ["Summary.", ...identifiers.map((identifier) => `- ${identifier} waits on you`)].join("\n");
+  }
+
+  async function writeSummary(cardId: string, generationIssueId: string, summarizerId: string, companyId: string, markdown?: string) {
+    markdown ??= await summaryListingTaskItems(generationIssueId);
     const run = await getDb().insert(heartbeatRuns).values({ companyId, agentId: summarizerId, status: "running" }).returning().then((rows) => rows[0]!);
     await getDb().update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, generationIssueId));
     await statusCardService(getDb()).writeSummary(cardId, {

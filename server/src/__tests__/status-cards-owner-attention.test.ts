@@ -172,6 +172,23 @@ describeEmbeddedPostgres("status card owner attention", () => {
     expect(Object.keys(stored.fingerprint ?? {})).toEqual([watched.id]);
   });
 
+  it("rejects a summary that omits a listed Attention item and accepts one that names it", async () => {
+    const { company, summarizer, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const blocker = await seedIssue(company.id, `${issuePrefix}-374`, "Terminal on the MacBook", "todo");
+    await seedBlock(company.id, blocker.id, watched.id);
+    await seedHumanOnlyCard(company.id, blocker.id, "Run the prepared tailscale command", new Date());
+    const card = await seedCard(company.id, OWNER_USER_ID);
+    const result = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+    const generationId = result.generatingIssue!.id;
+    expect(listedItems(result.generatingIssue!.description).items.map((item) => item.identifier)).toContain(blocker.identifier);
+
+    await expect(writeSummary(card.id, generationId, summarizer.id, company.id, "Nothing is waiting on you.")).rejects.toThrow(
+      new RegExp(`omits listed Attention item\\(s\\): .*${blocker.identifier}`),
+    );
+    await writeSummary(card.id, generationId, summarizer.id, company.id, `- ${blocker.identifier} waits on you`);
+  });
+
   it("bounds the blocker walk itself, not only the watched list", async () => {
     const { company, issuePrefix } = await seedCompany();
     const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");

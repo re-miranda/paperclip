@@ -50,9 +50,11 @@ import {
   type StatusCardBlockerChain,
   type StatusCardOwnerAttention,
 } from "./status-card-owner-attention.js";
+import { assertSummaryListsAttentionItems, listedAttentionItems } from "./status-card-summary-guard.js";
 import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
 import {
   anonymizePrivateDepartures,
+  companyVisibleIssueIds,
   storedFingerprintHoldsCompanyHiddenIssue,
   storedFingerprintHidesIssue,
 } from "./status-card-privacy.js";
@@ -659,11 +661,12 @@ export function statusCardService(
     }
     // Issues mentioned in the latest summary join the watched set alongside the
     // compiled-query matches, so their later changes fire deltas too.
-    const mentioned = await loadIssueSummaries(
-      card.companyId,
-      (card.mentionedIssueIds ?? []).filter((issueId) => !issueMap.has(issueId)),
-      options,
-    );
+    // Summaries must name every listed Attention item, so mentions are now
+    // routine: one that has since turned private must not reach the company-
+    // readable update task (MIR-385).
+    const unlisted = (card.mentionedIssueIds ?? []).filter((issueId) => !issueMap.has(issueId));
+    const visibleIds = await companyVisibleIssueIds(db, card.companyId, unlisted);
+    const mentioned = await loadIssueSummaries(card.companyId, unlisted.filter((issueId) => visibleIds.has(issueId)), options);
     for (const issue of mentioned) issueMap.set(issue.id, issue);
     return [...issueMap.values()];
   }
@@ -927,6 +930,7 @@ export function statusCardService(
         throw forbidden("Generation task is no longer active");
       }
       const payload = parseGenerationPayload(generationIssue.description);
+      assertSummaryListsAttentionItems(input.markdown, listedAttentionItems(payload));
       const updateKind = payload?.operation === "update" && (payload.kind === "full" || payload.kind === "incremental") ? payload.kind : "full";
       const trigger = payload?.operation === "update" && ["manual", "interval", "reactive", "restore"].includes(String(payload.trigger))
         ? payload.trigger as "manual" | "interval" | "reactive" | "restore"

@@ -83,7 +83,7 @@ describeEmbeddedPostgres("status card summary after a watched blocker turns priv
     await seedBlock(company.id, blocker.id, watched.id);
     const card = await seedCard(company.id, OWNER_USER_ID);
     const first = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
-    await writeSummary(card.id, first.generatingIssue!.id, summarizer.id, company.id, `Waiting on ${BLOCKER_TITLE}.`);
+    await writeSummary(card.id, first.generatingIssue!.id, summarizer.id, company.id, `Waiting on ${BLOCKER_TITLE} (${blocker.identifier}).`);
     await db.update(issues).set({
       visibility: "private", privacyRootIssueId: blocker.id, responsibleUserId: OWNER_USER_ID, updatedAt: new Date(),
     }).where(eq(issues.id, blocker.id));
@@ -142,7 +142,7 @@ describeEmbeddedPostgres("status card summary after a watched blocker turns priv
     const updates = await request(admin).get(`/api/status-cards/${card.id}/updates`);
 
     expect(history.status).toBe(200);
-    expect(history.body.map((revision: { body: string }) => revision.body)).toContain(`Waiting on ${BLOCKER_TITLE}.`);
+    expect(history.body.map((revision: { body: string }) => revision.body)).toEqual(expect.arrayContaining([expect.stringContaining(`Waiting on ${BLOCKER_TITLE}`)]));
     expect(JSON.stringify(updates.body)).toContain(BLOCKER_TITLE);
   });
 });
