@@ -54,7 +54,6 @@ import { assertSummaryListsAttentionItems, listedAttentionItems } from "./status
 import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
 import {
   anonymizePrivateDepartures,
-  companyVisibleIssueIds,
   storedFingerprintHoldsCompanyHiddenIssue,
   storedFingerprintHidesIssue,
 } from "./status-card-privacy.js";
@@ -661,12 +660,11 @@ export function statusCardService(
     }
     // Issues mentioned in the latest summary join the watched set alongside the
     // compiled-query matches, so their later changes fire deltas too.
-    // Summaries must name every listed Attention item, so mentions are now
-    // routine: one that has since turned private must not reach the company-
-    // readable update task (MIR-385).
-    const unlisted = (card.mentionedIssueIds ?? []).filter((issueId) => !issueMap.has(issueId));
-    const visibleIds = await companyVisibleIssueIds(db, card.companyId, unlisted);
-    const mentioned = await loadIssueSummaries(card.companyId, unlisted.filter((issueId) => visibleIds.has(issueId)), options);
+    const mentioned = await loadIssueSummaries(
+      card.companyId,
+      (card.mentionedIssueIds ?? []).filter((issueId) => !issueMap.has(issueId)),
+      options,
+    );
     for (const issue of mentioned) issueMap.set(issue.id, issue);
     return [...issueMap.values()];
   }
@@ -726,8 +724,13 @@ export function statusCardService(
       watchedIssues: watched.snapshot.filter(companyVisible),
       edgesByIssueId: watched.chain.edgesByIssueId,
     });
-    const fingerprint = attachOwnerAttention(buildStatusCardFingerprint(watched.snapshot), ownerAttention);
-    return { snapshot: watched.snapshot, ownerAttention, fingerprint };
+    // Hidden issues stay out of everything the update task carries (text,
+    // changes, fingerprint): mentions are routine once summaries must name
+    // listed items (MIR-385). writeSummary re-adds mentioned issues to the
+    // stored fingerprint, which keeps the redaction evidence (MIR-414).
+    const snapshot = watched.snapshot.filter(companyVisible);
+    const fingerprint = attachOwnerAttention(buildStatusCardFingerprint(snapshot), ownerAttention);
+    return { snapshot, ownerAttention, fingerprint };
   }
 
   async function readPreviousSummary(card: StatusCardRow): Promise<string | null> {

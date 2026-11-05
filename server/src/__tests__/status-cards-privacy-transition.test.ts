@@ -133,6 +133,25 @@ describeEmbeddedPostgres("status card summary after a watched blocker turns priv
     expect(JSON.stringify(updates.body)).not.toContain(BLOCKER_TITLE);
   });
 
+  it("redacts a summary that first names an already-private unrelated issue (MIR-414)", async () => {
+    const { company, summarizer, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const secret = await seedIssue(company.id, `${issuePrefix}-900`, BLOCKER_TITLE, "todo");
+    await db.update(issues).set({
+      visibility: "private", privacyRootIssueId: secret.id, responsibleUserId: OWNER_USER_ID, updatedAt: new Date(),
+    }).where(eq(issues.id, secret.id));
+    const card = await seedCard(company.id, OWNER_USER_ID);
+    const first = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+    await writeSummary(card.id, first.generatingIssue!.id, summarizer.id, company.id, `${watched.identifier} is stuck. Also see ${BLOCKER_TITLE} (${secret.identifier}).`);
+    await seedUnrelatedMember(company.id);
+
+    const detail = await request(createStatusCardApp(db, unrelatedMemberActor(company.id))).get(`/api/status-cards/${card.id}`);
+    const next = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+
+    expect(detail.body).toMatchObject({ privacyRedacted: true, summaryBody: null });
+    expect(next.generatingIssue!.description).not.toContain(BLOCKER_TITLE);
+  });
+
   it("still shows summary history to a viewer who can read the blocker", async () => {
     const { company, card } = await seedSummaryNamingPrivatizedBlocker();
     await seedUnrelatedMember(company.id);
