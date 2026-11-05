@@ -158,3 +158,19 @@ export async function storedFingerprintHidesIssue(
   ]);
   return readable.size < existing.size;
 }
+
+/**
+ * Whether the stored fingerprint holds an issue some company member cannot
+ * read now; the previous summary may then name it, so it must not be copied
+ * into a company-readable update task (MIR-406).
+ *
+ * @example
+ * await storedFingerprintHoldsCompanyHiddenIssue(db, card); // true -> rebuild without previous summary
+ */
+export async function storedFingerprintHoldsCompanyHiddenIssue(
+  db: Db,
+  card: { companyId: string; fingerprint: StatusCardFingerprint | null },
+): Promise<boolean> {
+  const hidden = await companyHiddenIssueIds(db, card.companyId, Object.keys(card.fingerprint ?? {}));
+  return hidden.size > 0;
+}

@@ -51,11 +51,16 @@ import {
   type StatusCardOwnerAttention,
 } from "./status-card-owner-attention.js";
 import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
-import { anonymizePrivateDepartures, storedFingerprintHidesIssue } from "./status-card-privacy.js";
+import {
+  anonymizePrivateDepartures,
+  storedFingerprintHoldsCompanyHiddenIssue,
+  storedFingerprintHidesIssue,
+} from "./status-card-privacy.js";
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
 type StatusCardRow = typeof statusCards.$inferSelect;
+type StatusCardUpdateRow = typeof statusCardUpdates.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
 type WatchedIssueSummary = CompanySearchIssueSummary & { latestHumanCommentAt?: string | null };
 type StatusCardWatchedIssues = {
@@ -363,8 +368,35 @@ export function statusCardService(
     return db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, cardId)).orderBy(desc(statusCardUpdates.startedAt));
   }
 
-  async function listSummaryRevisions(card: Pick<StatusCardRow, "companyId" | "documentId">) {
+  /**
+   * Whether this viewer must not see the card's stored summaries, by the same
+   * check as `hydrate`. Fails closed: history has no other redaction (MIR-406).
+   *
+   * @example
+   * await summaryHiddenFromViewer(card, { issueReadCondition }); // true -> no bodies
+   */
+  async function summaryHiddenFromViewer(card: StatusCardRow, options: StatusCardReadOptions): Promise<boolean> {
+    if (!options.issueReadCondition) return false;
+    const visibility = await readWatchedIssueVisibility(card, options);
+    return visibility?.privacyRedacted ?? true;
+  }
+
+  /**
+   * The card's update history as this viewer may see it: a redacted viewer
+   * gets no change summaries or changed-issue lists, which repeat summary text.
+   *
+   * @example
+   * await listUpdatesForViewer(card, { issueReadCondition }); // [{ changeSummary: null, changes: [] }]
+   */
+  async function listUpdatesForViewer(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<StatusCardUpdateRow[]> {
+    const [updates, hidden] = await Promise.all([listUpdates(card.id), summaryHiddenFromViewer(card, options)]);
+    if (!hidden) return updates;
+    return updates.map((update) => ({ ...update, changeSummary: null, changes: [] }));
+  }
+
+  async function listSummaryRevisions(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (!card.documentId) return [];
+    if (await summaryHiddenFromViewer(card, options)) return [];
     return db
       .select({
         id: documentRevisions.id,
@@ -695,6 +727,12 @@ export function statusCardService(
     return { snapshot: watched.snapshot, ownerAttention, fingerprint };
   }
 
+  async function readPreviousSummary(card: StatusCardRow): Promise<string | null> {
+    if (!card.documentId) return null;
+    const rows = await db.select({ latestBody: documents.latestBody }).from(documents).where(eq(documents.id, card.documentId));
+    return rows[0]?.latestBody ?? null;
+  }
+
   async function requestRefresh(cardId: string, input: {
     full?: boolean;
     trigger?: "manual" | "interval" | "reactive" | "restore";
@@ -769,8 +807,10 @@ export function statusCardService(
     const history = await listUpdates(card.id);
     const lastContentUpdate = history.find((row) => row.kind !== "compile") ?? null;
     const firstFullIndex = history.findIndex((row) => row.kind === "full");
+    // A summary written while a watched issue was public may name it (MIR-406).
+    const rebuildFromScratch = await storedFingerprintHoldsCompanyHiddenIssue(db, card);
     const kind = chooseStatusCardUpdateKind({
-      explicitFull: input.full,
+      explicitFull: input.full || rebuildFromScratch,
       hasDocument: Boolean(card.documentId),
       changeCount: changes.length,
       queryVersion: card.queryVersion,
@@ -780,9 +820,7 @@ export function statusCardService(
       restoreRefresh: trigger === "restore",
     });
     const summarizerAgentId = await resolveSummarizerAgentId(card);
-    const previousSummary = card.documentId
-      ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
-      : null;
+    const previousSummary = rebuildFromScratch ? null : await readPreviousSummary(card);
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
     let deduplicated = false;
     const created = await issuesSvc.create(card.companyId, {
@@ -1028,5 +1066,5 @@ export function statusCardService(
     }));
   }
 
-  return { list, getById, hydrate, create, update, remove, listUpdates, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
+  return { list, getById, hydrate, create, update, remove, listUpdates, listUpdatesForViewer, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
 }

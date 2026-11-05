@@ -1,32 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { desc, eq } from "drizzle-orm";
-import {
-  activityLog,
-  agents,
-  companies,
-  createDb,
-  decisionArchiveNotificationOutbox,
-  decisionQueueItems,
-  decisionQueues,
-  decisionRetention,
-  decisions,
-  decisionTriage,
-  decisionTriageEvents,
-  documentRevisions,
-  documents,
-  heartbeatRuns,
-  inboxDismissals,
-  issueComments,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issues,
-  statusCards,
-  statusCardUpdates,
-} from "@paperclipai/db";
-import { companySearchQuerySchema, statusCardRefreshPolicySchema, type CompanySearchIssueSummary } from "@paperclipai/shared";
-import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
+import { eq } from "drizzle-orm";
+import { createDb, issueRecoveryActions, issueRelations, issueThreadInteractions, issues, statusCards } from "@paperclipai/db";
 import { attentionService } from "../services/attention.js";
 import { issueReadSqlCondition } from "../services/authorization.js";
 import { readStatusCardBlockerChain, STATUS_CARD_MAX_BLOCKER_ISSUES } from "../services/status-card-owner-attention.js";
@@ -35,37 +9,22 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  listedItems,
+  OWNER_USER_ID,
+  readUpdatePayload,
+  statusCardAttentionFixtures,
+} from "./helpers/status-card-attention-fixtures.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 type Db = ReturnType<typeof createDb>;
-type OwnerAttentionPayload =
-  | { owner: "none" }
-  | { owner: "user"; items: Array<{ itemId: string; issueId: string; identifier: string | null }>; elsewhereCount: number };
-
-const OWNER_USER_ID = "owner-user";
-// Every trigger off: only owner Attention changes may wake the card.
-const TRIGGERS_OFF_POLICY = statusCardRefreshPolicySchema.parse({
-  mode: "interval",
-  intervalMinutes: 15,
-  triggers: { anyUpdate: false, membershipChanges: false, assigneeChanges: false, humanComments: false, statusTransitions: false },
-});
-
-function readUpdatePayload(description: string | null) {
-  const match = description?.match(/```json\n([\s\S]*?)\n```/);
-  return JSON.parse(match![1]!) as { kind: string; ownerAttention: OwnerAttentionPayload };
-}
-
-function listedItems(description: string | null) {
-  const attention = readUpdatePayload(description).ownerAttention;
-  if (attention.owner !== "user") throw new Error(`expected an owned card, got ${JSON.stringify(attention)}`);
-  return attention;
-}
 
 describeEmbeddedPostgres("status card owner attention", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const { clearTables, seedCompany, seedIssue, seedPrivateIssue, asSearchSummary, seedBlock, seedHumanOnlyCard, seedCard, ownerItemIdFor, writeSummary, tick, updateRowFor } = statusCardAttentionFixtures(() => db);
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-status-card-attention-");
@@ -73,127 +32,12 @@ describeEmbeddedPostgres("status card owner attention", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Reading the Attention desk materializes decision queues, so clear them too.
-    await db.delete(inboxDismissals);
-    await db.delete(decisionArchiveNotificationOutbox);
-    await db.delete(decisionRetention);
-    await db.delete(decisionTriageEvents);
-    await db.delete(decisionTriage);
-    await db.delete(decisionQueueItems);
-    await db.delete(decisionQueues);
-    await db.delete(decisions);
-    await db.delete(statusCardUpdates);
-    await db.delete(statusCards);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueRelations);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(companies);
+    await clearTables();
   });
 
   afterAll(async () => {
     await tempDb?.cleanup();
   });
-
-  async function seedCompany() {
-    const issuePrefix = `MR${randomUUID().replace(/[^A-F]/gi, "").slice(0, 4).toUpperCase()}`;
-    const company = await db.insert(companies).values({ name: "Owner Attention Co", issuePrefix }).returning().then((rows) => rows[0]!);
-    const summarizer = await db.insert(agents).values({
-      companyId: company.id,
-      name: "Summarizer",
-      role: "general",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: { model: "gpt-5.4" },
-      metadata: withBuiltInAgentMarker(null, { key: "summarizer", featureKeys: ["summarizer"] }),
-    }).returning().then((rows) => rows[0]!);
-    return { company, summarizer, issuePrefix };
-  }
-
-  async function seedIssue(companyId: string, identifier: string, title: string, status: string) {
-    return db.insert(issues).values({ companyId, identifier, title, status, priority: "medium" }).returning().then((rows) => rows[0]!);
-  }
-
-  async function seedPrivateIssue(companyId: string, identifier: string, title: string, status = "todo") {
-    const id = randomUUID();
-    return db.insert(issues).values({
-      id, companyId, identifier, title, status, priority: "medium",
-      visibility: "private", privacyRootIssueId: id, responsibleUserId: OWNER_USER_ID,
-    }).returning().then((rows) => rows[0]!);
-  }
-
-  function asSearchSummary(issue: typeof issues.$inferSelect): CompanySearchIssueSummary {
-    return { ...issue, status: issue.status as "blocked", priority: issue.priority as "medium", updatedAt: issue.updatedAt.toISOString() };
-  }
-
-  async function seedBlock(companyId: string, blockerId: string, blockedId: string) {
-    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: blockedId, type: "blocks" });
-  }
-
-  async function seedHumanOnlyCard(companyId: string, issueId: string, title: string, at: Date) {
-    return db.insert(issueThreadInteractions).values({
-      companyId,
-      issueId,
-      kind: "ask_user_questions",
-      status: "pending",
-      requestedResolverPolicy: "human_only",
-      effectiveResolverPolicy: "human_only",
-      title,
-      payload: { version: 1, questions: [] },
-      createdAt: at,
-      updatedAt: at,
-    }).returning().then((rows) => rows[0]!);
-  }
-
-  async function seedCard(companyId: string, createdByUserId: string | null) {
-    return db.insert(statusCards).values({
-      companyId,
-      createdByUserId,
-      title: "Rosana questionnaire validation queue",
-      interestPrompt: "Rosana questionnaire validation queue",
-      queries: [companySearchQuerySchema.parse({ q: "Rosana", scope: "issues", limit: 20 })],
-      queryVersion: 1,
-      refreshPolicy: TRIGGERS_OFF_POLICY,
-      state: "active",
-    }).returning().then((rows) => rows[0]!);
-  }
-
-  async function ownerItemIdFor(companyId: string, interactionId: string) {
-    const feed = await attentionService(db).list(companyId, { userId: OWNER_USER_ID, all: true, allowUnscopedAll: true });
-    return feed.items.find((item) => item.subject.id === interactionId)!.id;
-  }
-
-  async function writeSummary(cardId: string, generationIssueId: string, summarizerId: string, companyId: string) {
-    const run = await db.insert(heartbeatRuns).values({ companyId, agentId: summarizerId, status: "running" }).returning().then((rows) => rows[0]!);
-    await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, generationIssueId));
-    await statusCardService(db).writeSummary(cardId, {
-      generationIssueId,
-      markdown: "Summary.",
-      changeSummary: "Summary.",
-      model: "gpt-5.4",
-    }, { agentId: summarizerId, runId: run.id });
-    // The Summarizer closes its task after writing, as in production.
-    await db.update(issues).set({ status: "done" }).where(eq(issues.id, generationIssueId));
-  }
-
-  async function tick(cardId: string) {
-    await db.update(statusCards).set({ nextEvalAt: new Date(Date.now() - 1000) }).where(eq(statusCards.id, cardId));
-    return statusCardService(db).tickDueStatusCards(new Date());
-  }
-
-  // A fingerprint seen before reuses its generation task, so take the newest ledger row.
-  async function updateRowFor(generationIssueId: string) {
-    return db.select().from(statusCardUpdates)
-      .where(eq(statusCardUpdates.generationIssueId, generationIssueId))
-      .orderBy(desc(statusCardUpdates.startedAt))
-      .then((rows) => rows[0]!);
-  }
 
   it("4 Nov regression, full update: lists the blocker's pending card first and counts unrelated items elsewhere", async () => {
     const { company, issuePrefix } = await seedCompany();
