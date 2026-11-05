@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   inboxDismissals,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -27,6 +28,7 @@ import {
 import { companySearchQuerySchema, statusCardRefreshPolicySchema, type CompanySearchIssueSummary } from "@paperclipai/shared";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { attentionService } from "../services/attention.js";
+import { issueReadSqlCondition } from "../services/authorization.js";
 import { readStatusCardBlockerChain, STATUS_CARD_MAX_BLOCKER_ISSUES } from "../services/status-card-owner-attention.js";
 import { statusCardService } from "../services/status-cards.js";
 import {
@@ -85,6 +87,7 @@ describeEmbeddedPostgres("status card owner attention", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueThreadInteractions);
+    await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
     await db.delete(issueComments);
     await db.delete(issues);
@@ -380,5 +383,55 @@ describeEmbeddedPostgres("status card owner attention", () => {
     await writeSummary(card.id, result.generatingIssue!.id, summarizer.id, company.id);
     const stored = await db.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0]!);
     expect(JSON.stringify(stored.fingerprint)).not.toContain(privateBlocker.id);
+  });
+
+  it("never lists a recovery item, so its link to a private recovery issue stays out of the task", async () => {
+    const { company, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const privateRecovery = await seedPrivateIssue(company.id, `${issuePrefix}-380`, "Confidential recovery notes");
+    await db.insert(issueRecoveryActions).values({
+      companyId: company.id, sourceIssueId: watched.id, recoveryIssueId: privateRecovery.id, kind: "manual_review",
+      status: "active", ownerType: "user", ownerUserId: OWNER_USER_ID, cause: "stalled", fingerprint: "f1", nextAction: "Check the vendor reply",
+    });
+    const card = await seedCard(company.id, OWNER_USER_ID);
+    const feed = await attentionService(db).list(company.id, { userId: OWNER_USER_ID, all: true, allowUnscopedAll: true });
+    // Precondition: the desk's recovery item names the public source but links to the private recovery issue.
+    expect(feed.items.some((item) => item.sourceKind === "recovery_action" && item.relatedIssue?.id === watched.id)).toBe(true);
+
+    const result = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+
+    const description = result.generatingIssue!.description!;
+    for (const secret of ["Confidential recovery notes", privateRecovery.id, privateRecovery.identifier!]) {
+      expect(description).not.toContain(secret);
+    }
+    expect(listedItems(description).items.some((item) => item.issueId === watched.id && item.itemId.startsWith("recovery"))).toBe(false);
+  });
+
+  it("redacts the card and anonymizes the change once a watched blocker turns private", async () => {
+    const { company, summarizer, issuePrefix } = await seedCompany();
+    const watched = await seedIssue(company.id, `${issuePrefix}-317`, "Rosana questionnaire: validate answers", "blocked");
+    const blocker = await seedIssue(company.id, `${issuePrefix}-374`, "Vendor contract renewal", "todo");
+    await seedBlock(company.id, blocker.id, watched.id);
+    const card = await seedCard(company.id, OWNER_USER_ID);
+    const first = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+    await writeSummary(card.id, first.generatingIssue!.id, summarizer.id, company.id);
+    await db.update(issues).set({
+      visibility: "private", privacyRootIssueId: blocker.id, responsibleUserId: OWNER_USER_ID, updatedAt: new Date(),
+    }).where(eq(issues.id, blocker.id));
+    const viewer = await issueReadSqlCondition(db, { type: "board", userId: "unrelated-viewer", source: "session" });
+
+    const stored = await db.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0]!);
+    const hydrated = await statusCardService(db).hydrate(stored, { issueReadCondition: viewer });
+    expect(hydrated).toMatchObject({ privacyRedacted: true, summaryBody: null, fingerprint: null });
+
+    const next = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+    for (const secret of ["Vendor contract renewal", blocker.id, blocker.identifier!]) {
+      expect(next.generatingIssue!.description!).not.toContain(secret);
+    }
+    // With every trigger off only the resolved desk item on the blocker survives the filter; it must be anonymous too.
+    expect(next.changes!.some((change) => change.issueId === blocker.id)).toBe(false);
+    expect(next.changes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ issueId: "private issue", identifier: "private issue", title: "", from: null, to: null }),
+    ]));
   });
 });

@@ -51,6 +51,7 @@ import {
   type StatusCardOwnerAttention,
 } from "./status-card-owner-attention.js";
 import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
+import { anonymizePrivateDepartures, storedFingerprintHidesIssue } from "./status-card-privacy.js";
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
@@ -188,8 +189,12 @@ export function statusCardService(
     try {
       const visible = await executeQueries(card, options);
       if (!options.issueReadCondition) return { count: visible.length, privacyRedacted: false };
-      const total = await executeQueries(card);
-      return { count: visible.length, privacyRedacted: total.length !== visible.length };
+      const [total, storedHidesIssue] = await Promise.all([
+        executeQueries(card),
+        // An issue that left the watched set by turning private may still be in the summary (MIR-396).
+        storedFingerprintHidesIssue(db, card, options.issueReadCondition),
+      ]);
+      return { count: visible.length, privacyRedacted: total.length !== visible.length || storedHidesIssue };
     } catch (err) {
       logger.warn(
         { err, cardId: card.id, companyId: card.companyId },
@@ -221,6 +226,8 @@ export function statusCardService(
 
     return {
       ...card,
+      // The fingerprint names watched issues, so it is redacted with the summary.
+      fingerprint: watchedIssues?.privacyRedacted ? null : card.fingerprint,
       summaryBody: watchedIssues?.privacyRedacted ? null : document?.latestBody ?? null,
       ...(watchedIssues === undefined ? {} : {
         watchedIssueCount: watchedIssues.count,
@@ -710,7 +717,12 @@ export function statusCardService(
 
     const now = input.now ?? new Date();
     const { snapshot, ownerAttention, fingerprint } = await readWatchedState(card, input.loadOwnerAttention);
-    const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
+    const allChanges = await anonymizePrivateDepartures(
+      db,
+      card.companyId,
+      diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint),
+      fingerprint,
+    );
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
     const trigger = input.trigger ?? "manual";
     const forceRun = trigger === "manual" || trigger === "restore";

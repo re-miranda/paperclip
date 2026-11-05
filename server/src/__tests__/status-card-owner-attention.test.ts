@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AttentionItem, AttentionSubject } from "@paperclipai/shared";
 import { attentionItemIssueIds } from "../services/decision-queues.js";
+import { referencedIssueIds } from "../services/status-card-privacy.js";
 import {
   attachOwnerAttention,
   memoizeOwnerAttentionLoader,
@@ -60,7 +61,8 @@ describe("status card owner attention", () => {
       cardIssues: [watched("B")],
       watchedIssues: new Map([["B", watched("B")], ["A", watched("A", "todo")]]),
       edgesByIssueId: new Map([["B", ["A"]]]),
-      companyVisibleIssueIds: new Set(["A", "B", "U"]),
+      listableItemIds: new Set(["unrelated", "on-blocker"]),
+      issuePrefix: "MIR",
     });
 
     expect(ranked.items.map((item) => [item.itemId, item.identifier, item.heldUpIdentifiers])).toEqual([
@@ -79,7 +81,8 @@ describe("status card owner attention", () => {
       cardIssues: [watched("B1"), watched("B2"), watched("B3"), watched("Closed", "done")],
       watchedIssues: new Map(["A", "C", "B1", "B2", "B3", "Closed"].map((id) => [id, watched(id)])),
       edgesByIssueId: new Map([["B1", ["A"]], ["B2", ["A"]], ["B3", ["C"]], ["Closed", ["C"]]]),
-      companyVisibleIssueIds: new Set(["A", "C", "B1", "B2", "B3", "Closed"]),
+      listableItemIds: new Set(["small-first-on-desk", "big", "small-later-on-desk"]),
+      issuePrefix: "MIR",
     });
 
     expect(ranked.items.map((item) => [item.itemId, item.holdsUpCount])).toEqual([
@@ -89,7 +92,7 @@ describe("status card owner attention", () => {
     ]);
   });
 
-  it("counts, never lists, a desk item whose subject is a private blocker of a public card issue", () => {
+  it("counts, never lists, a watched item the privacy rules did not clear", () => {
     const privateSubject = { ...issueSubjectFixture("Private"), title: "Confidential vendor dispute" };
     const blockerItem = { id: "blocker", rank: 1, sourceKind: "blocker_attention", subject: privateSubject, relatedIssue: issueSubjectFixture("B") } as AttentionItem;
     const ranked = rankStatusCardOwnerAttention({
@@ -97,10 +100,21 @@ describe("status card owner attention", () => {
       cardIssues: [watched("B")],
       watchedIssues: new Map([["B", watched("B")]]),
       edgesByIssueId: new Map(),
-      companyVisibleIssueIds: new Set(["B"]),
+      listableItemIds: new Set<string>(),
+      issuePrefix: "MIR",
     });
 
     expect(ranked).toEqual({ items: [], elsewhereCount: 1 });
+  });
+
+  it("finds every issue id an item mentions, including ones only in its metadata", () => {
+    const recoveryId = "0f5a2c71-9f5c-4b6c-8a9e-1b2c3d4e5f60";
+    const item = {
+      subject: { kind: "recovery_action", id: "R", companyId: "co", title: "t", identifier: null, status: "active", href: null, metadata: { recoveryIssueId: recoveryId.toUpperCase() } },
+      relatedIssue: issueSubjectFixture("B"),
+    } as AttentionItem;
+
+    expect(referencedIssueIds(item)).toEqual(["B", recoveryId]);
   });
 
   it("stores listed item ids on the issue they sit on", () => {
