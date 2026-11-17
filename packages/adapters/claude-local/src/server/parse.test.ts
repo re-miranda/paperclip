@@ -5,6 +5,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeProviderQuotaError,
+  isClaudeTerminalQuotaStop,
   isClaudeTransientUpstreamError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeRefusalResult,
@@ -579,5 +580,116 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
     expect(parsed.usageBasis).toBe("per_run");
     expect(parsed.costUsd).toBeNull();
+  });
+});
+
+// MIR-1176: the real 16 Nov stop text (MIR-1056) and a tool-output line that
+// trips the broad sign-in match.
+const USAGE_LIMIT_STOP_TEXT = "You've hit your 5-hour limit · resets 2:40am (UTC)";
+const UNAUTHORIZED_TOOL_LINE = JSON.stringify({
+  type: "user",
+  message: { content: [{ type: "tool_result", content: "curl: (22) HTTP 401 Unauthorized" }] },
+});
+
+describe("usage-limit stops outrank the broad sign-in match (MIR-1176)", () => {
+  const now = new Date("2026-11-16T22:05:00.000Z");
+  const limitResult = { is_error: true, subtype: "success", result: USAGE_LIMIT_STOP_TEXT };
+
+  it("classifies the 16 Nov 5-hour message as provider quota with the next 02:40 UTC reset", () => {
+    expect(isClaudeProviderQuotaError({ parsed: limitResult })).toBe(true);
+    expect(isClaudeTransientUpstreamError({ parsed: limitResult })).toBe(false);
+    expect(extractClaudeRetryNotBefore({ parsed: limitResult }, now)?.toISOString()).toBe(
+      "2026-11-17T02:40:00.000Z",
+    );
+  });
+
+  it("accepts weekly and other hyphenated or two-word qualifiers", () => {
+    for (const wording of ["weekly", "7-day", "5-hour usage", "Opus weekly"]) {
+      const errorMessage = `You've hit your ${wording} limit · resets 9am (UTC)`;
+      expect(isClaudeProviderQuotaError({ errorMessage })).toBe(true);
+      expect(extractClaudeRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
+        "2026-11-17T09:00:00.000Z",
+      );
+    }
+  });
+
+  it("shows the cause: tool output containing Unauthorized trips the broad sign-in match", () => {
+    const loginMeta = detectClaudeLoginRequired({
+      parsed: limitResult,
+      stdout: UNAUTHORIZED_TOOL_LINE,
+      stderr: "",
+    });
+    expect(loginMeta.requiresLogin).toBe(true);
+  });
+
+  it("keeps provider quota when tool output contains Unauthorized", () => {
+    const input = { parsed: limitResult, stdout: UNAUTHORIZED_TOOL_LINE, stderr: "" };
+    expect(isClaudeTerminalQuotaStop(input)).toBe(true);
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
+    expect(extractClaudeRetryNotBefore(input, now)?.toISOString()).toBe("2026-11-17T02:40:00.000Z");
+  });
+
+  it("keeps provider quota on the unparsed path when the limit text is in stderr", () => {
+    const input = { parsed: null, stdout: UNAUTHORIZED_TOOL_LINE, stderr: USAGE_LIMIT_STOP_TEXT };
+    expect(isClaudeTerminalQuotaStop(input)).toBe(true);
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
+  });
+
+  it("takes the reset time from the run's own words, not from quoted tool output", () => {
+    // MIR-1189: a diagnostic first stderr line keeps the reset out of the
+    // fallback error message, and raw stdout precedes stderr in the haystack.
+    const quotedResetToolLine = JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            content: "Example: You've hit your 5-hour limit · resets 9am (UTC). curl: (22) HTTP 401 Unauthorized",
+          },
+        ],
+      },
+    });
+    const unparsed = {
+      parsed: null,
+      stdout: quotedResetToolLine,
+      stderr: `Warning: diagnostic line\n${USAGE_LIMIT_STOP_TEXT}`,
+      errorMessage: "Claude exited with code 1: Warning: diagnostic line",
+    };
+    expect(isClaudeProviderQuotaError(unparsed)).toBe(true);
+    expect(extractClaudeRetryNotBefore(unparsed, now)?.toISOString()).toBe("2026-11-17T02:40:00.000Z");
+
+    const parsedRun = { parsed: limitResult, stdout: quotedResetToolLine, stderr: "" };
+    expect(extractClaudeRetryNotBefore(parsedRun, now)?.toISOString()).toBe("2026-11-17T02:40:00.000Z");
+  });
+
+  it("lets a final result that itself reports a sign-in failure win", () => {
+    const tokenFailure = {
+      is_error: true,
+      result: `Failed to authenticate: OAuth token has expired. ${USAGE_LIMIT_STOP_TEXT}`,
+    };
+    const loginPrompt = { is_error: true, result: `Please run /login. ${USAGE_LIMIT_STOP_TEXT}` };
+    for (const parsed of [tokenFailure, loginPrompt]) {
+      expect(isClaudeTerminalQuotaStop({ parsed })).toBe(false);
+      expect(isClaudeProviderQuotaError({ parsed })).toBe(false);
+      expect(detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin).toBe(true);
+    }
+  });
+
+  it("does not treat an unparsed sign-in prompt in stderr as a quota stop", () => {
+    const input = { parsed: null, stdout: "", stderr: `Unauthorized\n${USAGE_LIMIT_STOP_TEXT}` };
+    expect(isClaudeTerminalQuotaStop(input)).toBe(false);
+    expect(isClaudeProviderQuotaError(input)).toBe(false);
+  });
+
+  it("ignores quota wording that appears only in tool output", () => {
+    const quotaToolLine = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: USAGE_LIMIT_STOP_TEXT }] },
+    });
+    const success = { is_error: false, subtype: "success", result: "Done." };
+    expect(isClaudeTerminalQuotaStop({ parsed: success, stdout: quotaToolLine })).toBe(false);
+    expect(
+      isClaudeTerminalQuotaStop({ parsed: null, stdout: `${quotaToolLine}\n${UNAUTHORIZED_TOOL_LINE}` }),
+    ).toBe(false);
   });
 });

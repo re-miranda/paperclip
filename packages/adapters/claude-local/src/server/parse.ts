@@ -22,12 +22,14 @@ const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+// MIR-1176: the qualifier before "limit" may be hyphenated ("5-hour") or two
+// words ("weekly usage"); `\w+` alone stopped at the hyphen and lost the reset.
 const CLAUDE_PROVIDER_QUOTA_RE =
-  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
+  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:[\w-]+\s+){0,2}limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,120}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:[\w-]+\s+){0,2}limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,120}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 
 /**
  * Sum the per-model usage ledger from a Claude CLI result event. The result
@@ -269,6 +271,45 @@ export function detectClaudeLoginRequired(input: {
     requiresLogin: loginPrompt || tokenFailure,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
+}
+
+// The CLI's own closing words when no result event was parsed: stderr, the
+// fallback error message, and stdout lines that are not stream-json events.
+// Tool output always travels inside a JSON event line, so it is left out.
+function collectClaudeUnparsedTerminalText(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  const plainStdoutLines = (input.stdout ?? "")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith("{"));
+  return [input.errorMessage ?? "", input.stderr ?? "", ...plainStdoutLines].join("\n");
+}
+
+/**
+ * Report whether the run's own final words are a usage-limit stop (MIR-1176).
+ * The broad login-prompt match in detectClaudeLoginRequired scans all raw
+ * output, so a tool line containing "Unauthorized" used to turn a usage-limit
+ * stop into a sign-in failure. Callers let a true result here outrank that
+ * match. A final result that itself reports a sign-in failure returns false.
+ *
+ * Example: `{ is_error: true, result: "You've hit your 5-hour limit · resets
+ * 2:40am (UTC)" }` returns true whatever the tool output says.
+ */
+export function isClaudeTerminalQuotaStop(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  if (parsed && !claudeResultIndicatesAuthFailure(parsed)) return false;
+  const terminalText = parsed
+    ? collectClaudeTerminalText(parsed)
+    : collectClaudeUnparsedTerminalText(input);
+  if (!CLAUDE_PROVIDER_QUOTA_RE.test(terminalText)) return false;
+  return !CLAUDE_AUTH_TOKEN_FAILURE_RE.test(terminalText) && !CLAUDE_LOGIN_PROMPT_RE.test(terminalText);
 }
 
 export function describeClaudeFailure(parsed: Record<string, unknown>): string | null {
@@ -543,8 +584,16 @@ export function extractClaudeRetryNotBefore(
   },
   now = new Date(),
 ): Date | null {
-  const haystack = buildClaudeTransientHaystack(input);
-  const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
+  // MIR-1176: the run's own final words come first. The haystack puts raw
+  // stdout ahead of the later stderr lines, so a reset time quoted in tool
+  // output could otherwise replace the real one and delay the recovery wake.
+  const parsed = input.parsed ?? null;
+  const terminalText = parsed
+    ? collectClaudeTerminalText(parsed)
+    : collectClaudeUnparsedTerminalText(input);
+  const match =
+    terminalText.match(CLAUDE_EXTRA_USAGE_RESET_RE) ??
+    buildClaudeTransientHaystack(input).match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
 }
@@ -588,7 +637,9 @@ export function isClaudeProviderQuotaError(input: {
     stdout: input.stdout ?? "",
     stderr: input.stderr ?? "",
   });
-  if (loginMeta.requiresLogin) return false;
+  // MIR-1176: a usage-limit stop in the final result outranks the broad
+  // sign-in match on raw output.
+  if (loginMeta.requiresLogin && !isClaudeTerminalQuotaStop(input)) return false;
 
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;

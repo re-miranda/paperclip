@@ -70,6 +70,7 @@ import {
   parseClaudeStreamJson, createClaudeStreamParser,
   describeClaudeFailure,
   detectClaudeLoginRequired,
+  isClaudeTerminalQuotaStop,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
@@ -1034,8 +1035,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      // MIR-1176: a usage-limit stop in the CLI's own closing words outranks
+      // the broad sign-in match, which also scans tool output.
+      const requiresLogin =
+        loginMeta.requiresLogin &&
+        !(
+          (proc.exitCode ?? 0) !== 0 &&
+          isClaudeTerminalQuotaStop({
+            parsed: null,
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+            errorMessage: fallbackErrorMessage,
+          })
+        );
       const providerQuota =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
           parsed: null,
@@ -1044,7 +1058,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
@@ -1067,7 +1081,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // surfaces the typed `duplex_channel_lost` code before any provider
         // classification, so the CLI lane and the ACP lane report it alike.
         ? proc.errorCode
-        : loginMeta.requiresLogin
+        : requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
           parsed: null,
@@ -1178,9 +1192,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
+    // MIR-1176: a usage-limit stop in the final result outranks the broad
+    // sign-in match, which also scans tool output. A final result that itself
+    // reports a sign-in failure still wins (see isClaudeTerminalQuotaStop).
+    const requiresLogin =
+      loginMeta.requiresLogin &&
+      !(
+        failed &&
+        !clearSessionForMaxTurns &&
+        !poisonedPreviousMessageId &&
+        isClaudeTerminalQuotaStop({ parsed })
+      );
     const providerQuota =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
@@ -1191,7 +1216,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     const transientUpstream =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       !providerQuota &&
@@ -1214,7 +1239,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
-      : loginMeta.requiresLogin
+      : requiresLogin
       ? "claude_auth_required"
       // Structured CLI signals outrank the model-not-found detector, which
       // scans the run's full stdout for a literal "model not found" phrase.
