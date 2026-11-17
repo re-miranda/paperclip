@@ -352,12 +352,25 @@ async function recordActivity(
   });
 }
 
-function itemIssueId(item: AttentionItem) {
-  if (item.subject.kind === "issue") return item.subject.id;
-  const related = item.relatedIssue?.kind === "issue" ? item.relatedIssue.id : null;
-  if (related) return related;
+/**
+ * Every issue an Attention item sits on, most specific first: the subject
+ * issue, the related issue, then the issue named in the subject metadata.
+ *
+ * @example
+ * attentionItemIssueIds(blockerItem); // [terminalBlockerId, blockedIssueId]
+ */
+export function attentionItemIssueIds(item: AttentionItem): string[] {
   const metadataIssueId = item.subject.metadata?.issueId ?? item.subject.metadata?.originIssueId;
-  return typeof metadataIssueId === "string" ? metadataIssueId : null;
+  const candidates = [
+    item.subject.kind === "issue" ? item.subject.id : null,
+    item.relatedIssue?.kind === "issue" ? item.relatedIssue.id : null,
+    typeof metadataIssueId === "string" ? metadataIssueId : null,
+  ];
+  return [...new Set(candidates.filter((issueId): issueId is string => Boolean(issueId)))];
+}
+
+function itemIssueId(item: AttentionItem) {
+  return attentionItemIssueIds(item)[0] ?? null;
 }
 
 export function decisionQueueService(db: Db) {

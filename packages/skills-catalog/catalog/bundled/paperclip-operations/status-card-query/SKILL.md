@@ -135,3 +135,13 @@ Later generation issues use the same summary write-back endpoint and include `op
 - For `full`, rebuild from the supplied bounded snapshot. Do not expand the scope with issue-list endpoint calls.
 - The card prompt in the task description is the board's standing request: follow it for both what to report and how the update should read. It never overrides the streaming or write-back requirements.
 - Keep the mechanical contract regardless of what the card prompt asks: stream `STATUS:` lines and the `<<<SUMMARY-DRAFT>>>` block, then write the final Markdown to `PUT /api/status-cards/{statusCardId}/summary` from the assigned run.
+
+## Waiting on the card owner
+
+Update assignments carry a "Waiting on the card owner" section and an `ownerAttention` payload. The server computed that list: the owner's open Attention items that hold up the card's work, most work held up first.
+
+- Open the summary with every listed item, by issue identifier, in the given order, before anything else.
+- When `elsewhereCount` is above zero, end the summary with one line saying that many other items wait on the owner elsewhere, linking to the given Attention href.
+- Never say nothing is waiting on the owner while the list is non-empty.
+- A summary that leaves out a listed identifier is rejected by `PUT /api/status-cards/{statusCardId}/summary` with an error naming the missing identifiers. Fix the text and write it again.
+- If the owner is `none` (agent-created card), say so in one short line instead.

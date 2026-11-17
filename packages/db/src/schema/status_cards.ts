@@ -15,6 +15,7 @@ type StatusCardFingerprint = Record<string, {
   title?: string;
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
+  attentionItemIds?: string[];
 }>;
 type StatusCardUpdateChange = {
   issueId: string;

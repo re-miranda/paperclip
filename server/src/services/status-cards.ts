@@ -40,11 +40,40 @@ import {
   type StatusCardDeltaChange,
   type StatusCardFingerprint,
 } from "./status-card-update-engine.js";
+import {
+  attachOwnerAttention,
+  computeStatusCardOwnerAttention,
+  memoizeOwnerAttentionLoader,
+  ownerAttentionLoader,
+  readStatusCardBlockerChain,
+  type OwnerAttentionLoader,
+  type StatusCardBlockerChain,
+  type StatusCardOwnerAttention,
+} from "./status-card-owner-attention.js";
+import { assertSummaryListsAttentionItems, listedAttentionItems } from "./status-card-summary-guard.js";
+import { ownerAttentionPayload, ownerAttentionPromptSection } from "./status-card-owner-attention-prompt.js";
+import {
+  anonymizePrivateDepartures,
+  storedFingerprintHoldsCompanyHiddenIssue,
+  storedFingerprintHidesIssue,
+} from "./status-card-privacy.js";
 
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
 type StatusCardRow = typeof statusCards.$inferSelect;
+type StatusCardUpdateRow = typeof statusCardUpdates.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
+type WatchedIssueSummary = CompanySearchIssueSummary & { latestHumanCommentAt?: string | null };
+type StatusCardWatchedIssues = {
+  cardIssues: CompanySearchIssueSummary[];
+  snapshot: WatchedIssueSummary[];
+  chain: StatusCardBlockerChain;
+};
+type StatusCardWatchedState = {
+  snapshot: WatchedIssueSummary[];
+  ownerAttention: StatusCardOwnerAttention;
+  fingerprint: StatusCardFingerprint;
+};
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
@@ -88,6 +117,7 @@ function updateDescription(input: {
   trigger: "manual" | "interval" | "reactive" | "restore";
   previousSummary: string | null;
   snapshot: CompanySearchIssueSummary[];
+  ownerAttention: StatusCardOwnerAttention;
 }) {
   const mechanical = `Return the completed Markdown through \`PUT /api/status-cards/${input.card.id}/summary\` with \`generationIssueId\`, a short non-empty \`changeSummary\`, and the model id. Do not call issue-list endpoints. Preserve the streaming STATUS and <<<SUMMARY-DRAFT>>> sentinels used by the Summarizer. Issues the Markdown references by identifier (e.g. ABC-123) or issue link automatically join the card's watched set, so reference an issue only when the board should keep tracking it.`;
   // The card prompt is the board's single standing request: it already says
@@ -95,7 +125,7 @@ function updateDescription(input: {
   // summary instructions — there is no separate default prompt to append to
   // or replace.
   const task = `${input.kind === "incremental"
-    ? "Patch the previous status summary using only the changed issues."
+    ? "Patch the previous status summary using the changed issues and the current \"Waiting on the card owner\" list."
     : "Rebuild the status summary from the bounded issue snapshot."} Write the update the way the card prompt below asks — it describes what the board is watching and how they want the update written. Honor it when compatible with the trusted mechanical requirements, and default to roughly 300–500 output tokens when it does not say otherwise.`;
   const promptBlock = `\n\n## Card prompt (board-provided)\n\n${untrustedPromptBlock("card-prompt", input.card.interestPrompt)}`;
   const payload = {
@@ -109,8 +139,10 @@ function updateDescription(input: {
     trigger: input.trigger,
     changes: input.changes.map(({ issueId, identifier, from, to, changeKind }) => ({ issueId, identifier, from, to, changeKind })),
     queryVersion: input.card.queryVersion,
+    ownerAttention: ownerAttentionPayload(input.ownerAttention),
   };
-  return `Update this Paperclip status card.\n\n${UNTRUSTED_PROMPT_RULE}\n\n${task}${promptBlock}\n\n${mechanical}\n\n## Previous summary\n\n${untrustedPromptBlock("previous-summary", input.previousSummary ?? null)}\n\n## Changed issues\n\n${untrustedPromptBlock("changed-issues", input.changes.map(({ issueId, identifier, title, from, to, changeKind }) => ({ issueId, identifier, title, from, to, changeKind })))}\n\n${input.kind === "full" ? `## Bounded snapshot\n\n${untrustedPromptBlock("bounded-snapshot", input.snapshot.map(({ id, identifier, title, status }) => ({ id, identifier, title, status })))}` : ""}\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
+  const ownerSection = ownerAttentionPromptSection(input.ownerAttention, untrustedPromptBlock);
+  return `Update this Paperclip status card.\n\n${UNTRUSTED_PROMPT_RULE}\n\n${task}${promptBlock}\n\n${mechanical}\n\n${ownerSection}\n\n## Previous summary\n\n${untrustedPromptBlock("previous-summary", input.previousSummary ?? null)}\n\n## Changed issues\n\n${untrustedPromptBlock("changed-issues", input.changes.map(({ issueId, identifier, title, from, to, changeKind }) => ({ issueId, identifier, title, from, to, changeKind })))}\n\n${input.kind === "full" ? `## Bounded snapshot\n\n${untrustedPromptBlock("bounded-snapshot", input.snapshot.map(({ id, identifier, title, status }) => ({ id, identifier, title, status })))}` : ""}\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
 }
 
 function compileDescription(card: StatusCardRow, generationIssueId: string | null, hash: string) {
@@ -149,11 +181,12 @@ function parseGenerationPayload(description: string | null) {
 
 export function statusCardService(
   db: Db,
-  deps: { issuesSvc?: ReturnType<typeof issueService> } = {},
+  deps: { issuesSvc?: ReturnType<typeof issueService>; loadOwnerAttention?: OwnerAttentionLoader } = {},
 ) {
   const builtIns = builtInAgentService(db);
   const issuesSvc = deps.issuesSvc ?? issueService(db);
   const searchSvc = companySearchService(db);
+  const loadOwnerAttention = deps.loadOwnerAttention ?? ownerAttentionLoader(db);
 
   async function readWatchedIssueVisibility(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (card.queries.length === 0 && (card.mentionedIssueIds?.length ?? 0) === 0) {
@@ -162,8 +195,12 @@ export function statusCardService(
     try {
       const visible = await executeQueries(card, options);
       if (!options.issueReadCondition) return { count: visible.length, privacyRedacted: false };
-      const total = await executeQueries(card);
-      return { count: visible.length, privacyRedacted: total.length !== visible.length };
+      const [total, storedHidesIssue] = await Promise.all([
+        executeQueries(card),
+        // An issue that left the watched set by turning private may still be in the summary (MIR-396).
+        storedFingerprintHidesIssue(db, card, options.issueReadCondition),
+      ]);
+      return { count: visible.length, privacyRedacted: total.length !== visible.length || storedHidesIssue };
     } catch (err) {
       logger.warn(
         { err, cardId: card.id, companyId: card.companyId },
@@ -195,6 +232,8 @@ export function statusCardService(
 
     return {
       ...card,
+      // The fingerprint names watched issues, so it is redacted with the summary.
+      fingerprint: watchedIssues?.privacyRedacted ? null : card.fingerprint,
       summaryBody: watchedIssues?.privacyRedacted ? null : document?.latestBody ?? null,
       ...(watchedIssues === undefined ? {} : {
         watchedIssueCount: watchedIssues.count,
@@ -330,8 +369,35 @@ export function statusCardService(
     return db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, cardId)).orderBy(desc(statusCardUpdates.startedAt));
   }
 
-  async function listSummaryRevisions(card: Pick<StatusCardRow, "companyId" | "documentId">) {
+  /**
+   * Whether this viewer must not see the card's stored summaries, by the same
+   * check as `hydrate`. Fails closed: history has no other redaction (MIR-406).
+   *
+   * @example
+   * await summaryHiddenFromViewer(card, { issueReadCondition }); // true -> no bodies
+   */
+  async function summaryHiddenFromViewer(card: StatusCardRow, options: StatusCardReadOptions): Promise<boolean> {
+    if (!options.issueReadCondition) return false;
+    const visibility = await readWatchedIssueVisibility(card, options);
+    return visibility?.privacyRedacted ?? true;
+  }
+
+  /**
+   * The card's update history as this viewer may see it: a redacted viewer
+   * gets no change summaries or changed-issue lists, which repeat summary text.
+   *
+   * @example
+   * await listUpdatesForViewer(card, { issueReadCondition }); // [{ changeSummary: null, changes: [] }]
+   */
+  async function listUpdatesForViewer(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<StatusCardUpdateRow[]> {
+    const [updates, hidden] = await Promise.all([listUpdates(card.id), summaryHiddenFromViewer(card, options)]);
+    if (!hidden) return updates;
+    return updates.map((update) => ({ ...update, changeSummary: null, changes: [] }));
+  }
+
+  async function listSummaryRevisions(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (!card.documentId) return [];
+    if (await summaryHiddenFromViewer(card, options)) return [];
     return db
       .select({
         id: documentRevisions.id,
@@ -580,7 +646,8 @@ export function statusCardService(
     return loadIssueSummaries(card.companyId, card.mentionedIssueIds ?? [], options);
   }
 
-  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+  /** Compiled-query matches plus summary-mentioned issues: the card's own issues. */
+  async function readCardIssues(card: StatusCardRow, options: StatusCardReadOptions): Promise<CompanySearchIssueSummary[]> {
     const issueMap = new Map<string, CompanySearchIssueSummary>();
     for (const storedQuery of card.queries) {
       const query = companySearchQuerySchema.parse(storedQuery);
@@ -599,7 +666,10 @@ export function statusCardService(
       options,
     );
     for (const issue of mentioned) issueMap.set(issue.id, issue);
-    const snapshot = [...issueMap.values()];
+    return [...issueMap.values()];
+  }
+
+  async function withLatestHumanComments(snapshot: CompanySearchIssueSummary[]): Promise<WatchedIssueSummary[]> {
     if (snapshot.length === 0) return snapshot;
     const latestHumanComments = await db
       .select({
@@ -622,11 +692,59 @@ export function statusCardService(
     return snapshot.map((issue) => ({ ...issue, latestHumanCommentAt: commentByIssueId.get(issue.id) ?? null }));
   }
 
+  /**
+   * The card's issues widened with the upstream "blocked by" chain, so a
+   * change on a blocker (including a new card waiting on the owner) is a
+   * change to the card (MIR-376).
+   */
+  async function readWatchedIssues(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<StatusCardWatchedIssues> {
+    const cardIssues = await readCardIssues(card, options);
+    const chain = await readStatusCardBlockerChain(db, card.companyId, cardIssues);
+    const blockers = await loadIssueSummaries(card.companyId, chain.blockerIssueIds, options);
+    const snapshot = await withLatestHumanComments([...cardIssues, ...blockers]);
+    return { cardIssues, snapshot, chain };
+  }
+
+  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}): Promise<WatchedIssueSummary[]> {
+    return (await readWatchedIssues(card, options)).snapshot;
+  }
+
+  /** Watched issues, the owner's "waiting on you" block, and the fingerprint over both. */
+  async function readWatchedState(
+    card: StatusCardRow,
+    load: OwnerAttentionLoader = loadOwnerAttention,
+  ): Promise<StatusCardWatchedState> {
+    const watched = await readWatchedIssues(card);
+    const companyVisible = (issue: CompanySearchIssueSummary) => watched.chain.visibleIssueIds.has(issue.id);
+    const ownerAttention = await computeStatusCardOwnerAttention({
+      db,
+      load,
+      card,
+      cardIssues: watched.cardIssues.filter(companyVisible),
+      watchedIssues: watched.snapshot.filter(companyVisible),
+      edgesByIssueId: watched.chain.edgesByIssueId,
+    });
+    // Hidden issues stay out of everything the update task carries (text,
+    // changes, fingerprint): mentions are routine once summaries must name
+    // listed items (MIR-385). writeSummary re-adds mentioned issues to the
+    // stored fingerprint, which keeps the redaction evidence (MIR-414).
+    const snapshot = watched.snapshot.filter(companyVisible);
+    const fingerprint = attachOwnerAttention(buildStatusCardFingerprint(snapshot), ownerAttention);
+    return { snapshot, ownerAttention, fingerprint };
+  }
+
+  async function readPreviousSummary(card: StatusCardRow): Promise<string | null> {
+    if (!card.documentId) return null;
+    const rows = await db.select({ latestBody: documents.latestBody }).from(documents).where(eq(documents.id, card.documentId));
+    return rows[0]?.latestBody ?? null;
+  }
+
   async function requestRefresh(cardId: string, input: {
     full?: boolean;
     trigger?: "manual" | "interval" | "reactive" | "restore";
     actor?: StatusCardActor;
     now?: Date;
+    loadOwnerAttention?: OwnerAttentionLoader;
   } = {}) {
     const card = await getById(cardId);
     if (!card) throw notFound("Status card not found");
@@ -642,9 +760,13 @@ export function statusCardService(
     }
 
     const now = input.now ?? new Date();
-    const snapshot = await executeQueries(card);
-    const fingerprint = buildStatusCardFingerprint(snapshot);
-    const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
+    const { snapshot, ownerAttention, fingerprint } = await readWatchedState(card, input.loadOwnerAttention);
+    const allChanges = await anonymizePrivateDepartures(
+      db,
+      card.companyId,
+      diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint),
+      fingerprint,
+    );
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
     const trigger = input.trigger ?? "manual";
     const forceRun = trigger === "manual" || trigger === "restore";
@@ -691,8 +813,10 @@ export function statusCardService(
     const history = await listUpdates(card.id);
     const lastContentUpdate = history.find((row) => row.kind !== "compile") ?? null;
     const firstFullIndex = history.findIndex((row) => row.kind === "full");
+    // A summary written while a watched issue was public may name it (MIR-406).
+    const rebuildFromScratch = await storedFingerprintHoldsCompanyHiddenIssue(db, card);
     const kind = chooseStatusCardUpdateKind({
-      explicitFull: input.full,
+      explicitFull: input.full || rebuildFromScratch,
       hasDocument: Boolean(card.documentId),
       changeCount: changes.length,
       queryVersion: card.queryVersion,
@@ -702,14 +826,12 @@ export function statusCardService(
       restoreRefresh: trigger === "restore",
     });
     const summarizerAgentId = await resolveSummarizerAgentId(card);
-    const previousSummary = card.documentId
-      ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
-      : null;
+    const previousSummary = rebuildFromScratch ? null : await readPreviousSummary(card);
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
     let deduplicated = false;
     const created = await issuesSvc.create(card.companyId, {
       title: `${kind === "full" ? "Rebuild" : "Update"} status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot, ownerAttention }),
       status: "todo",
       priority: "medium",
       assigneeAgentId: summarizerAgentId,
@@ -723,7 +845,7 @@ export function statusCardService(
       ? await issuesSvc.update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
       : created;
     const generationIssue = await issuesSvc.update(reopened!.id, {
-      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot, ownerAttention }),
     });
     const priorGenerationPredicate = card.generatingIssueId
       ? eq(statusCards.generatingIssueId, card.generatingIssueId)
@@ -769,6 +891,7 @@ export function statusCardService(
     const due = await db.select().from(statusCards).where(and(isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId), isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)));
     const enqueued: Array<{ cardId: string; generatingIssue: typeof issues.$inferSelect }> = [];
     let evaluated = 0;
+    const loadTickOwnerAttention = memoizeOwnerAttentionLoader(loadOwnerAttention);
     for (const candidate of due) {
       const claimUntil = new Date(now.getTime() + 5 * 60 * 1000);
       const [claimed] = await db.update(statusCards).set({ nextEvalAt: claimUntil })
@@ -777,7 +900,11 @@ export function statusCardService(
       if (!claimed) continue;
       evaluated += 1;
       try {
-        const result = await requestRefresh(claimed.id, { trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval", now });
+        const result = await requestRefresh(claimed.id, {
+          trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval",
+          now,
+          loadOwnerAttention: loadTickOwnerAttention,
+        });
         if (result.enqueued && result.generatingIssue) enqueued.push({ cardId: claimed.id, generatingIssue: result.generatingIssue });
       } catch (err) {
         logger.warn(
@@ -806,6 +933,7 @@ export function statusCardService(
         throw forbidden("Generation task is no longer active");
       }
       const payload = parseGenerationPayload(generationIssue.description);
+      assertSummaryListsAttentionItems(input.markdown, listedAttentionItems(payload));
       const updateKind = payload?.operation === "update" && (payload.kind === "full" || payload.kind === "incremental") ? payload.kind : "full";
       const trigger = payload?.operation === "update" && ["manual", "interval", "reactive", "restore"].includes(String(payload.trigger))
         ? payload.trigger as "manual" | "interval" | "reactive" | "restore"
@@ -815,7 +943,10 @@ export function statusCardService(
         : null;
       const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown);
       // Current watched membership: compiled-query matches plus the issues this
-      // summary mentions.
+      // summary mentions, with their blocker chain. Owner Attention items are
+      // deliberately absent: only items the update task actually listed count
+      // as covered, so the compile run's first summary leaves every open item
+      // to fire at the next diff (MIR-376).
       const watchedNow = buildStatusCardFingerprint(
         await executeQueries({ ...current, mentionedIssueIds }),
       );
@@ -832,7 +963,8 @@ export function statusCardService(
         }
         for (const issueId of mentionedIssueIds) {
           const entry = watchedNow[issueId];
-          if (entry) snapshot[issueId] = entry;
+          const listedItemIds = payloadFingerprint[issueId]?.attentionItemIds;
+          if (entry) snapshot[issueId] = listedItemIds ? { ...entry, attentionItemIds: listedItemIds } : entry;
         }
       } else {
         snapshot = watchedNow;
@@ -941,5 +1073,5 @@ export function statusCardService(
     }));
   }
 
-  return { list, getById, hydrate, create, update, remove, listUpdates, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
+  return { list, getById, hydrate, create, update, remove, listUpdates, listUpdatesForViewer, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
 }
