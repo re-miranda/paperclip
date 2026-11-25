@@ -1,0 +1,89 @@
+# Gambiarra. MIR-2027 (for MIR-1206): build, check and package ONE exact fork commit.
+# Lives only on the orphan branch `fork-build`; a push of fork-build/request.json starts a run.
+# No secrets, nothing is published: the package is a run artifact kept 30 days.
+name: Fork build
+
+on:
+  push:
+    branches: [fork-build]
+
+permissions:
+  contents: read
+
+env:
+  FORK_BUILD: request/fork-build
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.req.outputs.sha }}
+      label: ${{ steps.req.outputs.label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: request, persist-credentials: false }
+      - id: req
+        run: bash "$FORK_BUILD/ci.sh" request
+
+  # Gating path: install, build, server type-check, named tests, then packaging.
+  gate:
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: request, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: source, ref: "${{ needs.request.outputs.sha }}", fetch-depth: 1, persist-credentials: false }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with: { node-version: "24" }
+      - { name: Prepare, timeout-minutes: 25, run: 'bash "$FORK_BUILD/ci.sh" prepare' }
+      - { name: Build, timeout-minutes: 40, run: 'bash "$FORK_BUILD/ci.sh" build' }
+      - { name: Server type-check, timeout-minutes: 25, run: 'bash "$FORK_BUILD/ci.sh" typecheck' }
+      - { name: Named tests, timeout-minutes: 20, run: 'bash "$FORK_BUILD/ci.sh" tests' }
+      - name: Named tests summary
+        if: always()
+        run: python3 "$FORK_BUILD/summarize-vitest.py" logs/tests.log "Named tests" || true
+      - { name: Package, timeout-minutes: 25, run: 'bash "$FORK_BUILD/ci.sh" package' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-build-${{ needs.request.outputs.label }}-${{ needs.request.outputs.sha }}
+          path: result
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: fork-build-logs-${{ needs.request.outputs.label }}-${{ needs.request.outputs.sha }}
+          path: logs
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Non-gating: nothing needs this job, and its test step may fail without failing the run.
+  full-tests:
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: request, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { path: source, ref: "${{ needs.request.outputs.sha }}", fetch-depth: 1, persist-credentials: false }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with: { node-version: "24" }
+      - { name: Prepare, timeout-minutes: 25, run: 'bash "$FORK_BUILD/ci.sh" prepare' }
+      - { name: Build, timeout-minutes: 40, run: 'bash "$FORK_BUILD/ci.sh" build' }
+      # Step limit sits below the 120-minute job limit so the summary and upload steps below still run.
+      - { name: Full test suite, timeout-minutes: 70, continue-on-error: true, run: 'bash "$FORK_BUILD/ci.sh" full-tests' }
+      - name: Full suite summary
+        if: always()
+        run: python3 "$FORK_BUILD/summarize-vitest.py" logs/full-tests.log "Full test suite (non-gating)" || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: fork-build-full-tests-${{ needs.request.outputs.label }}-${{ needs.request.outputs.sha }}
+          path: logs
+          retention-days: 30
+          if-no-files-found: warn

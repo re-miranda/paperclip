@@ -1,0 +1,9 @@
+{
+  "sha": "a168c2ee516d0d02a25826d3f946d630e2c78530",
+  "label": "fix6",
+  "version": "2026.1106.0",
+  "tests": [
+    "packages/adapters/claude-local/src/server/parse.test.ts",
+    "packages/adapters/claude-local/src/server/execute.max-turns-classification.test.ts"
+  ]
+}
